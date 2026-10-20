@@ -67,6 +67,13 @@ def main():
     assert "Path to GGUF model file (required)" in help_text
     assert "8589934592" in help_text
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
+    assert "--jinja" in help_text
+    check(["serve", "llm", "--jinja"], 2, "--model <PATH> is required")
+    for prefix in (["serve"], ["serve", "llm"]):
+        check([*prefix, "--jinja", "--model", "missing.gguf"], 1,
+              "Error loading model")
+    for modality in ("tts", "asr", "video", "image"):
+        check(["serve", modality, "--jinja"], 2, "Unknown option")
     assert "--log-progress" in help_text
 
     # Verbosity must change the output, not merely parse. The config line is

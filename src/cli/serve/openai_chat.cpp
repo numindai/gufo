@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/jinja_prompt.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/quote_tracker.hpp"
 #include "src/cli/serve/response_format.hpp"
@@ -403,6 +404,9 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   if (!ParseContent(value.find("content"), message, budget, error)) {
     return false;
   }
+  if (const auto* content = value.find("content");
+      content && content->is_array())
+    message->content_parts_json = content->dump();
   if (const json::Value* reasoning = value.find("reasoning_content");
       reasoning != nullptr && !reasoning->is_null()) {
     if (message->role != tokenization::ChatRole::kAssistant ||
@@ -874,6 +878,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "invalid_reasoning");
   }
   if (const auto* kwargs = body.find("chat_template_kwargs")) {
+    output->chat.chat_template_kwargs = *kwargs;
     if (const auto* vision_id = kwargs->find("add_vision_id")) {
       if (!vision_id->is_bool())
         return Error(400, "Bad Request",
@@ -3836,6 +3841,8 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     }
     return NonStreamingResponse(parsed, backend, generation,
                                 initial_output_state);
+  } catch (const JinjaPromptError& exception) {
+    return Error(400, "Bad Request", exception.what(), "invalid_chat_template");
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);
   } catch (const std::invalid_argument& exception) {

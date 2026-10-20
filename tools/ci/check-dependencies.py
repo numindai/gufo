@@ -34,6 +34,8 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "ccv TensorOps ancestry",
     "llama.cpp / ggml",
     "ICU",
+    "Minja",
+    "nlohmann/json",
     "curl / libcurl",
     "FFmpeg",
 }

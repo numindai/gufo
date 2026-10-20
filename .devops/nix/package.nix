@@ -11,6 +11,7 @@
   libwebp,
   openssl,
   ffmpeg-headless,
+  fetchurl,
   rocmPackages,
   releaseVersion ? null,
   revision,
@@ -74,7 +75,7 @@ stdenv.mkDerivation {
     rocmPackages.rocblas
   ];
 
-  cmakeFlags = [
+  cmakeFlags = (import ./jinja.nix { inherit lib fetchurl; }) ++ [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
     "-DBUILD_TESTING=OFF"
     "-DGUFO_RELEASE_VERSION=${versionLabel}"

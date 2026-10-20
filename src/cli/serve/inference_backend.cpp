@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/jinja_prompt.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -280,7 +281,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
     std::string_view draft_artifact_fingerprint, std::uint32_t max_context,
     const hip::QwenExecutionPolicy& execution_policy, bool speculative,
     const speculative::SpeculativeOptions& speculative_options,
-    std::string_view draft_kind = "dflash2") {
+    std::string_view draft_kind = "dflash2", bool jinja = false) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen disk cache requires an artifact fingerprint");
@@ -298,9 +299,13 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "artifact_id=" << core::kGgufIdentityScheme << ':'
            << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
-           << "chat_template=qwen38-reasoning-compiled-v3\n"
+           << "chat_template="
+           << (jinja ? "gguf-minja-http-v1" : "qwen38-reasoning-compiled-v3")
+           << '\n'
            << "chat_template_reference_sha256="
-           << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
+           << (jinja ? "embedded-in-artifact"
+                     : tokenization::QwenChatTemplate::OfficialTemplateSha256())
+           << '\n'
            << "state_abi=" << state_abi << '\n'
            << "payload_layout=qwen-gfx1151-live-prefix-v3\n"
            // Older learned boundaries could keep logits from an earlier
@@ -972,19 +977,28 @@ public:
                  std::uint32_t max_context, QwenDraftModels drafts = {},
                  speculative::SpeculativeOptions speculative_options = {},
                  std::string artifact_fingerprint = {},
-                 std::string draft_artifact_fingerprint = {})
+                 std::string draft_artifact_fingerprint = {},
+                 bool use_jinja = false)
       : model_(std::move(model)),
         drafts_(std::move(drafts)),
         max_context_(max_context),
         speculative_options_(speculative_options),
         execution_policy_(hip::QwenExecutionPolicy::Production()) {
+    if (use_jinja) {
+      std::string error;
+      jinja_ = core::JinjaChatTemplate::CreateFromGguf(model_->GetGgufReader(),
+                                                       &error);
+      if (!jinja_)
+        throw std::invalid_argument(error);
+      Logger::Info("loader", "event=chat_template renderer=gguf_jinja");
+    }
     if (!artifact_fingerprint.empty()) {
       const bool speculative = drafts_.Enabled();
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenCompatibilityIdentity(
               artifact_fingerprint, draft_artifact_fingerprint, max_context_,
               execution_policy_, speculative, speculative_options_,
-              drafts_.Kind()),
+              drafts_.Kind(), jinja_ != nullptr),
           .payload_version = kQwenPersistentPayloadVersion,
       };
     }
@@ -1095,6 +1109,10 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
+    if (jinja_)
+      return model_->GetTokenizer().Encode(RenderJinjaPrompt(
+          *jinja_, request, model_->GetTokenizer(),
+          tokenization::RenderedPromptBoundBytes(max_context_)));
     return tokenization::QwenChatTemplate::RenderAndTokenize(
         model_->GetTokenizer(), request.messages,
         request.tool_choice == ChatRequest::ToolChoice::kNone
@@ -1105,12 +1123,18 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
+    if (jinja_) {
+      auto tokens = RenderAndTokenize(request);
+      return TextPreparedPrompt{std::move(*tokens), {}, 0};
+    }
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
                              model_->VisionEncoder(), max_context_);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
+    if (jinja_)
+      return RenderAndTokenize(request)->size();
     return CountQwenPromptTokens(request, model_->GetTokenizer(),
                                  model_->VisionEncoder(), max_context_);
   }
@@ -1124,6 +1148,13 @@ public:
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
+    if (jinja_) {
+      if (request.messages.empty())
+        return TextGenerationBackend::InitialOutputState::kAuto;
+      return JinjaOutputState(RenderJinjaPrompt(
+          *jinja_, request, model_->GetTokenizer(),
+          tokenization::RenderedPromptBoundBytes(max_context_)));
+    }
     return QwenChatOptions(request, max_context_).enable_thinking
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
@@ -1596,6 +1627,7 @@ private:
   }
 
   std::shared_ptr<const hip::QwenGpuModel> model_;
+  std::unique_ptr<core::JinjaChatTemplate> jinja_;
   QwenDraftModels drafts_;
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
@@ -3243,7 +3275,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            bool use_jinja) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3265,6 +3298,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     max_context = static_cast<std::uint32_t>(native);
+  }
+
+  if (use_jinja &&
+      (reader->GetMetadataString("general.architecture") == "deepseek4" ||
+       reader->GetMetadataString("general.architecture") == "qwen4exp")) {
+    SetError(error, "--jinja is not supported for DeepSeek or Flash-Next");
+    return false;
   }
 
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
@@ -3403,6 +3443,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
+  if (!use_jinja && !tokenization::QwenChatTemplate::ValidateGgufTemplate(
+                        *reader, &load_error)) {
+    SetError(error, "Unsupported Qwen chat template: " + load_error);
+    return false;
+  }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
@@ -3433,7 +3478,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), ram_cache_config);
+              std::move(resolved_disk_cache_config), ram_cache_config,
+              use_jinja);
 #else
   (void)model_path;
   (void)max_context;
@@ -3444,6 +3490,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)disk_cache_config;
   (void)vision_model_path;
   (void)ram_cache_config;
+  (void)use_jinja;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3457,9 +3504,14 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            bool use_jinja) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
+    return false;
+  }
+  if (!use_jinja && !tokenization::QwenChatTemplate::ValidateGgufTemplate(
+                        model->GetGgufReader(), error)) {
     return false;
   }
   if (max_context == 0)
@@ -3619,11 +3671,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
-    new_state->supports_images = model->VisionEncoder() != nullptr;
+    new_state->supports_images =
+        model->VisionEncoder() != nullptr && !use_jinja;
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(drafts), speculative_options,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint, use_jinja);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

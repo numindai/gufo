@@ -27,6 +27,13 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
   `/v1/models`). In practice: what your client's "model" field should say.
   Purely cosmetic, it does not change which weights are loaded.
 
+**Chat formatting**
+
+- `jinja` — opt into the GGUF's embedded chat template for Qwen HTTP serving.
+  The default remains Gufo's compiled formatter. This path supports text;
+  template-specific request variables belong in `chat_template_kwargs`.
+  See [chat templates](CHAT-TEMPLATES.md) for supported runtimes and examples.
+
 **Size and memory**
 
 - `context` — maximum context capacity; memory use depends on the model and

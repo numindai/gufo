@@ -16,7 +16,6 @@
 #include <utility>
 
 #include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
@@ -239,11 +238,6 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     if (error_msg != nullptr) {
       *error_msg = "GGUF reader must not be null";
     }
-    return nullptr;
-  }
-
-  if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
-                                                            error_msg)) {
     return nullptr;
   }
 

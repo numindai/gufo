@@ -21,6 +21,8 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | rocWMMA | Headers compiled into kernels | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocWMMA](https://github.com/ROCm/rocWMMA) |
 | Composable Kernel | Adapted short-attention arithmetic; no library/header dependency | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
 | ICU | Linked; Unicode normalization/tokenization | `Unicode-3.0` | 78.3; flake.lock | [unicode-org/icu](https://github.com/unicode-org/icu) |
+| Minja | Header-only Jinja renderer; one-line `is undefined` compatibility patch in `cmake/Jinja.cmake` | `MIT` | `143465ab2f924f7729a8ca5313a12fb83a106d6d` | [ochafik/minja](https://github.com/ochafik/minja) |
+| nlohmann/json | Private header-only dependency of the Jinja renderer | `MIT` | 3.12.0 | [nlohmann/json](https://github.com/nlohmann/json) |
 | curl / libcurl | Linked; image HTTPS and evaluation client | `curl` | 8.21.0; flake.lock | [curl/curl](https://github.com/curl/curl) |
 | OpenSSL | Linked; cryptographic hashes and HTTPS dependency | `Apache-2.0` | 3.6.3; flake.lock | [openssl/openssl](https://github.com/openssl/openssl) |
 | libpng | Linked; image decoding | `libpng-2.0` | 1.6.58; flake.lock | [pnggroup/libpng](https://github.com/pnggroup/libpng) |

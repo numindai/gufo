@@ -57,6 +57,10 @@ builds and header changes reuse cached objects; the configure log reports either
 `gufo: compiling C and CXX through ...` or `gufo: ccache not found`. HIP kernels
 are not launched through the cache.
 
+`nix build .#docker` packages the same production runtime as a Docker-compatible
+image stream. The [container guide](CONTAINERS.md) covers local loading and
+automatic GHCR publication.
+
 ### Presets
 
 | Configure preset | Build type | Contents |
@@ -137,6 +141,11 @@ four required documents `README.md`, `BENCHMARKS.md`, `QUALITY.md` and
 **A dependency.** Record it in `THIRD_PARTY_NOTICES.md`; `tools/ci/check-dependencies.py`
 validates that shipped and evaluation components carry license, version and
 source records.
+
+The optional Jinja chat renderer keeps Minja and nlohmann/json private to
+`gufo_core`. CMake and Nix share the hash-pinned archive manifest; see
+[chat template dependencies](CHAT-TEMPLATES.md#dependencies) and the
+[rendering API](CHAT-TEMPLATES.md#reusable-c-api).
 
 **Documentation.** `tools/ci/check-docs.py` enforces the presence of the
 maintained documents, resolves every local link and heading anchor offline, and

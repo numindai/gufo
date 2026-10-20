@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/json.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -112,6 +113,7 @@ struct ChatRequest {
   bool constrained_tools{false};
   bool parallel_tool_calls{true};
   ReasoningOptions reasoning;
+  json::Value chat_template_kwargs{json::Value::object()};
   bool add_vision_id{false};
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};

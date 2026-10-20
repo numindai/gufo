@@ -128,6 +128,13 @@
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; };
+          # Docker-compatible streams of the same production runtime.
+          docker = pkgs.${system}.callPackage ./.devops/nix/image.nix {
+            gufo = base;
+          };
+          docker-release = pkgs.${system}.callPackage ./.devops/nix/image.nix {
+            gufo = base.override { inherit releaseVersion; };
+          };
           # Optional benchmark packages: excluded from Gufo, the default
           # development shell and hosted checks.
           ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
@@ -185,6 +192,9 @@
         system:
         let
           pkgsSys = pkgs.${system};
+          jinjaCmakeFlags = pkgsSys.lib.escapeShellArgs (
+            pkgsSys.callPackage ./.devops/nix/jinja.nix { }
+          );
           root = toString ./.;
           mkFilteredSource =
             {
@@ -320,7 +330,7 @@
           } ''
             export HOME=$TMPDIR
             mkdir -p build && cd build
-            cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF
+            cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF ${jinjaCmakeFlags}
 
             python3 - "$src" <<'PY' > tidy-files.txt
             import json
@@ -453,7 +463,7 @@
             fi
 
             mkdir -p build && cd build
-            cmake "$src" -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON -DENGINE_ENABLE_HIP=OFF
+            cmake "$src" -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON -DENGINE_ENABLE_HIP=OFF ${jinjaCmakeFlags}
             ${if full then ''
               cmake --build . --parallel "$NIX_BUILD_CORES"
               ctest --output-on-failure --timeout 120

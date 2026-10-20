@@ -1,0 +1,133 @@
+name: Container
+
+on:
+  push:
+    branches: [ main, fork-enhancements, codex/jinja2-template ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+jobs:
+  publish:
+    name: Build and publish GHCR image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select image tags and package
+        id: image
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          output=docker
+          tags=()
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "Container releases require a stable vX.Y.Z tag." >&2
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+            if [[ "$version" != "$(tr -d '\r\n' < version.txt)" ]]; then
+              echo "The release tag must match version.txt." >&2
+              exit 1
+            fi
+            output=docker-release
+            tags=("$version" latest)
+          else
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | \
+              tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g' | cut -c1-100)
+            tags=("branch-$branch")
+            if [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+              tags+=(edge)
+            fi
+          fi
+          # Release and development binaries report different versions even
+          # when built from the same commit, so retain separate revision tags.
+          revision_tag="sha-$GITHUB_SHA"
+          if [[ "$output" == docker-release ]]; then
+            revision_tag="release-$revision_tag"
+          fi
+          tags=("$revision_tag" "${tags[@]}")
+          printf 'image=%s\noutput=%s\nrevision_tag=%s\n' \
+            "$image" "$output" "$revision_tag" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${tags[@]}" > "$RUNNER_TEMP/gufo-image-tags"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/gufo-docker" >> "$GITHUB_ENV"
+
+      - name: Free space for the ROCm toolchain
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          determinate: false
+
+      - name: Enable Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          use-flakehub: false
+          use-gha-cache: true
+
+      - name: Build production runtime image
+        env:
+          NIX_OUTPUT: ${{ steps.image.outputs.output }}
+        run: |
+          nix build ".#$NIX_OUTPUT" --out-link result-image \
+            --print-build-logs --cores 2 --max-jobs 1
+          ./result-image | docker load
+
+      - name: Label and smoke-test image
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          REVISION_TAG: ${{ steps.image.outputs.revision_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only metadata is added here; Nix/CMake built the executable.
+          printf 'FROM gufo:build\n' | docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:$REVISION_TAG" -
+          docker run --rm "$IMAGE:$REVISION_TAG" --version
+          docker run --rm "$IMAGE:$REVISION_TAG" serve llm --help
+
+      - name: Publish to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          REVISION_TAG: ${{ steps.image.outputs.revision_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+          while IFS= read -r tag; do
+            docker tag "$IMAGE:$REVISION_TAG" "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+            printf -- '- **%s:%s**\n' "$IMAGE" "$tag" >> "$GITHUB_STEP_SUMMARY"
+          done < "$RUNNER_TEMP/gufo-image-tags"
+
+      - name: Remove registry credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/gufo-docker"

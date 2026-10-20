@@ -184,6 +184,21 @@ Needs a C++20 compiler, CMake 3.21+, Ninja, ROCm (HIP, hipBLAS, hipBLASLt,
 rocBLAS, hipCUB, rocPRIM, rocWMMA) and ICU, libcurl, OpenSSL, libpng, libjpeg,
 libwebp. `nix build` builds the same thing with a pinned toolchain.
 
+## GGUF chat templates
+
+Gufo keeps its compiled chat formatters by default. For supported Qwen models,
+`gufo serve llm --jinja` opts into the Jinja template embedded in the GGUF.
+Rendering and inference run in Gufo; no Python runtime is required.
+See [chat templates](docs/CHAT-TEMPLATES.md) for a NuExtract request, the reusable
+C++ API, supported inputs and build dependencies.
+
+## Container images
+
+[GitHub Actions](.github/workflows/container.yml) can build the pinned
+production runtime and publish it to the repository's GHCR namespace.
+See [containers](docs/CONTAINERS.md) for automatic tags, setup and GPU launch
+commands, including opt-in GGUF Jinja templates.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Adapted code and dependencies keep their notices in

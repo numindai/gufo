@@ -144,6 +144,7 @@ add_library(gufo_core STATIC
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
   src/core/gguf_identity.cpp
+  src/core/jinja_chat_template.cpp
   src/core/json_constraint.cpp
   src/core/json_schema_lexeme.cpp
   src/core/json_schema_regex.cpp
@@ -169,6 +170,7 @@ add_library(gufo_core STATIC
   src/core/quant/ggml_gemm.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
+include(cmake/Jinja.cmake)
 target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
@@ -233,6 +235,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_http STATIC
+  src/cli/serve/jinja_prompt.cpp
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
   src/cli/serve/asr_service.cpp
@@ -682,6 +685,15 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
+
+  add_executable(jinja_chat_template_test tests/core/jinja_chat_template_test.cpp
+    src/cli/serve/jinja_prompt.cpp)
+  target_link_libraries(jinja_chat_template_test PRIVATE gufo_core)
+  target_compile_definitions(jinja_chat_template_test PRIVATE
+    GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/reference/chat_template.jinja"
+    GUFO_CHAT_TEMPLATE_HF_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
+  add_test(NAME jinja_chat_template_test COMMAND jinja_chat_template_test)
+  set_tests_properties(jinja_chat_template_test PROPERTIES LABELS "cpu;core;gguf;chat_template")
 
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)

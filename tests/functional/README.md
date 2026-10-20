@@ -360,3 +360,39 @@ benchmark and numerical quality tests; they do not establish upstream model
 parity. Sampled DSpark may differ across concurrency levels; fixed-path replay
 and greedy equality remain checked. API behavior and references are in
 [SERVER.md](../../docs/SERVER.md).
+
+## GGUF Jinja templates
+
+`jinja_http.py` checks the embedded GGUF template through `/v1/chat/completions`
+using curl against an already running server. Use a supported Qwen model with
+its template embedded and disable speculative decoding for this check:
+
+```sh
+# Keep this server running in a separate terminal.
+gufo serve llm --jinja --model /path/to/model.gguf \
+  --served-model-name nuextract --context 16384 --sessions 1 \
+  --speculative off --temperature 0 --host 127.0.0.1 --port 8080
+
+python3 tests/functional/jinja_http.py --url http://127.0.0.1:8080 \
+  --model nuextract --fixtures /path/to/hf-fixtures.json \
+  --output test-results/jinja-http
+```
+
+Fixtures are a JSON array with `name`, Hugging Face template `context`,
+independently generated `expected_token_ids`, and `expected_output` JSON.
+Include buffered/streaming examples, omitted and explicit thinking options,
+changed template kwargs, a long prompt, and a repeated prompt with
+`expect_cached: true`. `cache_prompt: false` requires zero reused tokens.
+Generate reference token IDs with the model's Hugging Face tokenizer and chat
+template, independently of Gufo. The HTTP API exposes prompt counts, not the
+full token sequence: the runner compares counts against those fixture IDs.
+The runner checks extracted JSON, prefill work and disabled drafting, and retains every request, response and per-request/phase timing.
+Negative cases use `expect_status`, `error_contains` and optional `error_code`;
+`kwargs_override` allows malformed kwargs. This is an opt-in, model-specific test, outside hosted
+CI. Custom templates previously rejected at load have no matching HTTP timing
+baseline; report their timings without a comparative performance claim.
+
+Also start the same custom artifact without `--jinja`: its unrecognized
+template must still fail default validation. Retain the startup logs for both
+runs, including the context limit and renderer selection. See the
+[feature contract](../../docs/CHAT-TEMPLATES.md) for supported inputs and errors.

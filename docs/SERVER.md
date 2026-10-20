@@ -302,13 +302,33 @@ checked: a cap of N resolves to at most N + 1 resident queues, so a value that
 will not fit is reported even though it is honoured. When a server cannot fit,
 it logs a `queue_budget_exceeded` warning and starts anyway.
 
+### GGUF chat templates
+
+The default uses compiled model-specific formatters and validates recognized
+GGUF template hashes. `gufo serve llm --jinja` selects the embedded
+`tokenizer.chat_template` for the Qwen GPU runner. It does not change model
+execution or enable unsupported architectures. DeepSeek and Flash-Next reject
+this option.
+
+On `/v1/chat/completions`, `chat_template_kwargs` supplies model-specific
+variables. Text content arrays and developer roles reach the template without
+flattening or merging; the template determines their meaning. Buffered and
+streaming text responses use the same rendering path. Image and tool inputs
+are unsupported in this mode.
+
+See [chat templates](CHAT-TEMPLATES.md) for the request contract, NuExtract
+example, cache behavior and errors. The startup log confirms selection with
+`event=chat_template renderer=gguf_jinja`.
+
 ### Reasoning controls
 
 `--think auto` uses the model's default. Qwen27B and Flash-Next match the
 official Jinja: thinking enabled, `xhigh` effort, prior reasoning preserved.
 Use `--think off` or `chat_template_kwargs.enable_thinking=false` for direct
 answers. DeepSeek defaults to thinking with `high` effort. Quality comparisons
-must use the same reasoning mode and effort.
+must use the same reasoning mode and effort. With `--jinja`, omitted template
+options use the embedded template's defaults; explicit server and request
+reasoning controls still apply.
 
 Keep `reasoning_effort` (Chat) or `output_config.effort` (Messages) consistent
 across turns while thinking is enabled: Qwen and DeepSeek render the effort
@@ -348,9 +368,7 @@ Generated reasoning is returned as `reasoning_content` in ordinary and
 streaming Chat Completions responses. Per-model effort mappings and history
 policies are documented in the model cards under `docs/models/`.
 
-The server uses compiled model-specific formatters and validates recognized
-artifact template hashes during model loading. It does not accept custom Jinja
-or claim to enforce a reasoning-token budget.
+The server does not enforce a reasoning-token budget.
 
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine
@@ -359,9 +377,9 @@ identity, request IDs, or token IDs.
 Pass the supported GGUF or safetensors directory through `--model`, with the
 matching projector or speculative sidecar where needed. Loaders validate
 tensor inventory, dimensions, quantization and tokenizer metadata. Model
-artifacts supply weights and metadata; executable kernels and templates are
-compiled into Gufo. See [model cards](models/README.md) for concrete paths
-and supported modes.
+artifacts supply weights and metadata; executable kernels are compiled into
+Gufo. Chat formatting uses the compiled default unless `--jinja` is selected.
+See [model cards](models/README.md) for concrete paths and supported modes.
 
 ## Process and State Ownership
 
@@ -685,10 +703,11 @@ ordinary continuation.
 - `messages`: `system` and `developer` messages may appear at any position.
   Agent clients such as Codex send them mid-conversation after context
   compaction or when session settings change. DeepSeek renders them in place.
-  Qwen's template accepts only one leading system turn, so Qwen models hoist
+  Qwen's compiled formatter accepts only one leading system turn, so it hoists
   them into it in their original relative order. That changes the prompt head:
   the request that introduces such a message is prefilled again, and later
-  requests that keep it reuse the whole prompt
+  requests that keep it reuse the whole prompt. With `--jinja`, roles and
+  ordering are passed to the embedded template unchanged
 - `max_tokens` or `max_completion_tokens`
 - `temperature`
 - `top_p`
@@ -696,6 +715,8 @@ ordinary continuation.
 - `stop`: null, one string, or an array of up to four strings
 - `stream`
 - `stream_options.include_usage`
+- `chat_template_kwargs`: shared reasoning controls; with `--jinja`, also
+  model-specific variables for the [embedded template](CHAT-TEMPLATES.md)
 - `return_progress` (see [Prompt progress](#prompt-progress))
 - `tools` and `tool_choice` when supported. Function tools accept the nested
   Chat Completions shape and the flat Responses-style `{type,name,parameters}`

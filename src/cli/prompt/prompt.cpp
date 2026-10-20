@@ -1021,6 +1021,10 @@ int RunPrompt(std::span<const char* const> args) {
   std::vector<tokenization::ContentSpan> content_spans;
   std::vector<tokenization::ChatMessage> messages;
   if (opt.use_chat_template) {
+    if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader, &err)) {
+      std::cerr << "Error formatting chat template: " << err << '\n';
+      return 1;
+    }
     if (!opt.system_prompt.empty()) {
       messages.push_back(
           {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
@@ -1238,6 +1242,12 @@ int RunChat(std::span<const char* const> args) {
     return 1;
   }
 #endif
+
+  if (opt.use_chat_template &&
+      !tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader, &err)) {
+    std::cerr << "Error formatting chat template: " << err << '\n';
+    return 1;
+  }
 
   const tokenization::QwenTokenizer* tokenizer = nullptr;
   std::string architecture;

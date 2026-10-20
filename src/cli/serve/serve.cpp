@@ -591,6 +591,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string dspark_model_path;
     std::string mtp_model_path;
     std::string vision_model_path;
+    bool use_jinja = false;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
@@ -621,6 +622,9 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--mmproj", "PATH",
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
+    parser.AddFlag("", "--jinja",
+                   "Use the GGUF Jinja chat template (text only; default: off)",
+                   "Model", &use_jinja);
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API", "Model",
                      &served_model_name);
@@ -1128,6 +1132,7 @@ int RunServe(std::span<const char* const> args) {
     std::string dspark_model_path;
     std::string mtp_model_path;
     std::string vision_model_path;
+    bool use_jinja = false;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
@@ -1158,6 +1163,10 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
+    llm_parser.AddFlag(
+        "", "--jinja",
+        "Use the GGUF Jinja chat template (text only; default: off)", "Model",
+        &use_jinja);
     llm_parser.AddOption("", "--served-model-name", "ID",
                          "Model identifier exposed by the OpenAI API", "Model",
                          &served_model_name);
@@ -1409,8 +1418,9 @@ int RunServe(std::span<const char* const> args) {
                            .model_artifact_fingerprint = {},
                        },
                        vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+                       server::TextRunnerRamCacheOptions{.capacity_bytes =
+                                                             cache_ram_bytes},
+                       use_jinja)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

@@ -53,6 +53,8 @@ struct ChatMessage {
 
   ChatRole role{ChatRole::kUser};
   std::string content;
+  /// Original HTTP content array, preserving text-part boundaries for Jinja.
+  std::string content_parts_json;
   /// Internal server-authored instructions following system/developer content.
   /// These bytes are template framing, never supplied by the HTTP message API.
   std::string framing_suffix;

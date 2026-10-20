@@ -5187,7 +5187,33 @@ void TestBracketDenseContent() {
   }
 }
 
+void TestJinjaContextForwarding() {
+  FakeBackend backend;
+  auto response = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[{"role":"developer","content":[
+      {"type":"text","text":"Example document"},
+      {"type":"text","text":"Example output"}]},
+      {"role":"user","content":[{"type":"text","text":"Document"}]}],
+    "chat_template_kwargs":{"template":"{\"name\":\"string\"}",
+      "instructions":"Extract names","enable_thinking":false}
+  })"),
+                                                 backend);
+  Expect(response.status == 200, "Jinja request accepted");
+  Expect(backend.last_request.chat_template_kwargs.member_str("instructions") ==
+             "Extract names",
+         "Model-specific template kwargs survive parsing");
+  const auto& message = backend.last_request.messages.front();
+  Expect(message.role == gufo::tokenization::ChatRole::kDeveloper,
+         "Jinja developer role is preserved");
+  const auto parts = gufo::json::parse(message.content_parts_json);
+  Expect(parts.items().size() == 2 &&
+             parts.items().back().member_str("text") == "Example output",
+         "Jinja example content parts remain distinct");
+}
+
 int main() {
+  TestJinjaContextForwarding();
   TestToolCallRenderParseRoundTrip();
   TestHistoricalTypedArgumentsUseTojson();
   TestStreamingPromptProgress();

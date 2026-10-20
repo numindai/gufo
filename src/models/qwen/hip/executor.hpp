@@ -92,6 +92,8 @@ public:
   QwenGpuModel(QwenGpuModel&&) = delete;
   QwenGpuModel& operator=(QwenGpuModel&&) = delete;
 
+  /// Load execution resources independently of chat formatting. Callers using
+  /// the compiled Qwen formatter must validate its GGUF template separately.
   [[nodiscard]] static std::shared_ptr<const QwenGpuModel> CreateFromGguf(
       std::shared_ptr<const core::GgufReader> reader,
       std::string* error_msg = nullptr,
@@ -110,6 +112,9 @@ public:
   }
   [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept {
     return weights_.config;
+  }
+  [[nodiscard]] const core::GgufReader& GetGgufReader() const noexcept {
+    return *reader_;
   }
   [[nodiscard]] std::size_t GetWeightRegionCount() const noexcept {
     return weight_regions_.size();
