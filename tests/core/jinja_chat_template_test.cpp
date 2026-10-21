@@ -165,6 +165,16 @@ void TestReplaceFilter() {
          "NuExtract replace filter supports counts and Unicode empty matches");
 }
 
+void TestMissingListItems() {
+  const auto renderer = Compile(
+      "{{ items[0] }}|{{ items[-1] }}|"
+      "{{ items[2] is undefined }}|{{ items[-3] is undefined }}|"
+      "{{ empty[-1] | default('missing') }}");
+  Expect(renderer->Render(parse(R"({"items":["first","last"],"empty":[]})")) ==
+             "first|last|True|True|missing",
+         "Missing list items are undefined, including empty developer parts");
+}
+
 void TestQwenReferenceGoldens() {
   const auto renderer = Compile(Read(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE));
   const auto goldens = parse(Read(GUFO_CHAT_TEMPLATE_HF_GOLDENS));
@@ -220,6 +230,33 @@ void TestQwenReferenceGoldens() {
     "reasoning_effort":"medium","preserve_thinking":false
   })");
   check("tool_loop_preserve");
+}
+
+void TestNuExtractReferenceGoldens() {
+  const std::string directory = GUFO_NUEXTRACT_FIXTURES;
+  const auto source = Read(directory + "/chat_template.jinja");
+  const auto goldens = parse(Read(directory + "/goldens.json"));
+  Expect(gufo::testing::chat_goldens::Sha256(source) ==
+             goldens.member_str("template_sha256"),
+         "NuExtract reference is the unchanged supplied template");
+  const auto renderer = Compile(source);
+  for (const auto& fixture :
+       gufo::testing::chat_goldens::Required(goldens, "cases").items()) {
+    std::string error;
+    const auto rendered = renderer->Render(
+        gufo::testing::chat_goldens::Required(fixture, "context"), &error);
+    const auto name = fixture.member_str("name");
+    if (fixture.find("error")) {
+      Expect(!rendered &&
+                 error.find(fixture.member_str("error")) != std::string::npos,
+             "NuExtract rejects " + name + ": " + error);
+    } else {
+      Expect(rendered.has_value(), "NuExtract renders " + name + ": " + error);
+      Expect(gufo::testing::chat_goldens::Sha256(*rendered) ==
+                 fixture.member_str("rendered_sha256"),
+             "NuExtract bytes match Python Jinja2: " + name);
+    }
+  }
 }
 
 void TestHttpAdapter() {
@@ -415,6 +452,55 @@ void TestHttpImages() {
   request.messages.back().images = {{0, blue}};
   Expect(prepare(*renderer).images.size() == 2,
          "Images across message history are supported");
+  request.messages.front().role = ChatRole::kDeveloper;
+  const auto examples_renderer = Compile(
+      "{% for message in messages %}{{ message.role }}:"
+      "{% for part in message.content %}"
+      "{% if part.type == 'image' %}"
+      "<|vision_start|><|image_pad|><|vision_end|>"
+      "{% else %}{{ part.text }}{% endif %}"
+      "{% endfor %}{% endfor %}");
+  Expect(RenderJinjaPrompt(*examples_renderer, request, *tokenizer, 4096) ==
+             "developer:<|vision_start|><|image_pad|><|vision_end|>"
+             "user:<|vision_start|><|image_pad|><|vision_end|>second",
+         "Embedded templates preserve developer examples before user input");
+  const auto examples_prompt = prepare(*examples_renderer);
+  Expect(
+      examples_prompt.images.size() == 2 &&
+          examples_prompt.images[0].pixels.pixels[0] == 255 &&
+          examples_prompt.images[1].pixels.pixels[2] == 255 &&
+          examples_prompt.images[0].grid.offset <
+              examples_prompt.images[1].grid.offset,
+      "Developer example and user input keep their own pixels and positions");
+
+  const auto nuextract = Compile(
+      Read(std::string(GUFO_NUEXTRACT_FIXTURES) + "/chat_template.jinja"));
+  request.chat_template_kwargs =
+      parse(R"({"template":"{\"name\":\"string\"}"})");
+  request.add_vision_id = true;
+  request.messages.front().content = "{\"name\":\"Bob\"}";
+  request.messages.front().content_parts_json = R"([
+    {"type":"image_url","image_url":{"url":"red"}},
+    {"type":"text","text":"{\"name\":\"Bob\"}"}])";
+  const auto rendered =
+      RenderJinjaPrompt(*nuextract, request, *tokenizer, 4096);
+  Expect(
+      rendered.find(
+          "【examples_start】\n【example_input_start】Picture 1: "
+          "<|vision_start|><|image_pad|><|vision_end|>【example_input_end】\n"
+          "【example_output_start】{\"name\":\"Bob\"}【example_output_end】\n"
+          "【examples_end】\n【document_start】\nPicture 2: "
+          "<|vision_start|><|image_pad|><|vision_end|>\nsecond\n"
+          "【document_end】") != std::string::npos,
+      "Exact NuExtract template separates developer input/output from the "
+      "target document and numbers images across both");
+  const auto nuextract_prompt = prepare(*nuextract);
+  Expect(nuextract_prompt.images.size() == 2 &&
+             nuextract_prompt.images[0].pixels.pixels[0] == 255 &&
+             nuextract_prompt.images[1].pixels.pixels[2] == 255 &&
+             nuextract_prompt.images[0].grid.offset <
+                 nuextract_prompt.images[1].grid.offset,
+         "Exact NuExtract template preserves example and target pixels");
 }
 
 }  // namespace
@@ -425,5 +511,7 @@ int main() {
   TestGgufAndContext();
   TestErrorsAndIsolation();
   TestReplaceFilter();
+  TestMissingListItems();
   TestQwenReferenceGoldens();
+  TestNuExtractReferenceGoldens();
 }

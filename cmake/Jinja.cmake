@@ -28,6 +28,16 @@ endif()
 string(REPLACE "${defined_test}"
   "${defined_test}\n              if (name == \"undefined\") return l.is_null();"
   minja_header "${minja_header}")
+# Jinja returns undefined for a missing list item. NuExtract reads the last
+# part of an empty developer example before deciding to skip that example.
+set(array_lookup "return array_->at(index < 0 ? array_->size() + index : index);")
+string(FIND "${minja_header}" "${array_lookup}" array_lookup_offset)
+if (array_lookup_offset EQUAL -1)
+  message(FATAL_ERROR "Minja changed: review the missing-list-item compatibility patch")
+endif()
+string(REPLACE "${array_lookup}"
+  "const auto size = static_cast<int64_t>(array_->size());\n      const auto resolved = index < 0 ? size + index : index;\n      return resolved < 0 || resolved >= size ? Value() : array_->at(resolved);"
+  minja_header "${minja_header}")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/jinja-include/minja/minja.hpp"
   CONTENT "${minja_header}" @ONLY)
 target_include_directories(gufo_core SYSTEM PRIVATE

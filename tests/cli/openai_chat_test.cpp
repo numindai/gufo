@@ -2237,6 +2237,37 @@ void TestImagePartsRetainOrderAndIdentity() {
   }
 }
 
+void TestDeveloperImageExamples() {
+  FakeBackend backend;
+  backend.pieces = {"ok"};
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[
+      {"role":"developer","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}},
+        {"type":"text","text":"example output"}]},
+      {"role":"user","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,BAUG"}}]}
+    ]
+  })"),
+                                                       backend);
+  Expect(response.status == 200, "Developer image examples reach the backend");
+  const auto& messages = backend.last_request.messages;
+  Expect(
+      messages.size() == 2 &&
+          messages[0].role == gufo::tokenization::ChatRole::kDeveloper &&
+          messages[1].role == gufo::tokenization::ChatRole::kUser &&
+          messages[0].content == "example output" &&
+          messages[0].images.size() == 1 && messages[1].images.size() == 1 &&
+          messages[0].images[0].offset == 0 &&
+          *messages[0].images[0].bytes ==
+              std::vector<std::uint8_t>({1, 2, 3}) &&
+          *messages[1].images[0].bytes == std::vector<std::uint8_t>({4, 5, 6}),
+      "Example and input roles, image identities and output remain distinct");
+  Expect(!messages[0].content_parts_json.empty(),
+         "The embedded template receives the example's original content parts");
+}
+
 void TestImageCountAndByteBudget() {
   const auto message = gufo::json::parse(R"({"role":"user","content":[
     {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]})");
@@ -2352,7 +2383,7 @@ void TestToolImagesRetainOrderAndIdentity() {
            "string tool output stays literal text even when it spells an image "
            "URL");
   }
-  for (const auto* role : {"assistant", "system", "developer"}) {
+  for (const auto* role : {"assistant", "system"}) {
     auto message = parse(R"({"content":[
       {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}
     ]})");
@@ -2364,7 +2395,7 @@ void TestToolImagesRetainOrderAndIdentity() {
     Expect(
         gufo::server::HandleOpenAiChat(Request(body.dump()), backend).status ==
             400,
-        "images remain rejected on non-observation roles");
+        "images remain rejected on assistant and system roles");
   }
   for (const auto* image :
        {R"({"url":17})",
@@ -5405,6 +5436,7 @@ int main() {
   TestClientIdentityReachesBackend();
   TestStreamingOverloadIsRejectedBeforeHeaders();
   TestImagePartsRetainOrderAndIdentity();
+  TestDeveloperImageExamples();
   TestImageCountAndByteBudget();
   TestToolImagesRetainOrderAndIdentity();
   std::cout << "All OpenAI chat protocol tests passed\n";

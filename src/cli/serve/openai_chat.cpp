@@ -281,10 +281,15 @@ bool ParseContent(const json::Value* content,
       const auto* image = part.find("image_url");
       const auto* url =
           image != nullptr && image->is_object() ? image->find("url") : nullptr;
+      // Embedded templates can use developer turns for multimodal examples.
+      // Compiled formatters still validate the roles their models support.
       if ((message->role != tokenization::ChatRole::kUser &&
+           message->role != tokenization::ChatRole::kDeveloper &&
            message->role != tokenization::ChatRole::kTool) ||
           url == nullptr || !url->is_string()) {
-        *error = "image_url requires a user or tool message and a string URL";
+        *error =
+            "image_url requires a user, developer, or tool message and a "
+            "string URL";
         return false;
       }
       // Resolution is model-owned; accept only the automatic policy rather

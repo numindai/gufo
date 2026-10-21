@@ -65,6 +65,12 @@ template. For NuExtract this includes `template`, `instructions`, `mode` and
 
 - Message order and `developer` roles are preserved. Text content arrays keep
   their boundaries, including the separate parts used by in-context examples.
+  NuExtract uses developer messages as examples in structured mode: each
+  `content` array contains input parts followed by one final text part holding
+  the expected output. Inputs can include text and `image_url` parts. Put the
+  examples before the target user document and provide the extraction schema
+  in `chat_template_kwargs.template`. Developer messages are examples here;
+  task instructions belong in `chat_template_kwargs.instructions`.
 - Images are supported with the model's matching `--mmproj` BF16 sidecar.
   Send standard `image_url` content parts alongside text. The adapter converts
   them to Hugging Face `image` parts; the embedded template must emit one
@@ -174,6 +180,8 @@ recorded in [third-party notices](../THIRD_PARTY_NOTICES.md).
 
 [CMake](../cmake/Jinja.cmake) adds Minja's missing `is undefined` inverse in a
 build-local header copy, preserving its existing null/undefined semantics.
+It also returns undefined for out-of-range list lookups, matching Jinja2 when
+the NuExtract template skips an empty developer example.
 The renderer also registers the `replace` filter used by NuExtract. These are
 compatibility additions, not changes to the template stored in the GGUF.
 
@@ -188,6 +196,14 @@ special-token defaults, ordered JSON, compatibility filters, Qwen reference
 goldens and the HTTP adapter. `openai_chat_test` checks request parsing;
 `serve_cli_test` checks flag parsing and help. Use the focused commands in
 [testing](TESTING.md).
+
+The unchanged supplied NuExtract template is retained in
+[`tests/fixtures/nuextract`](../tests/fixtures/nuextract). Its 48 independent
+Python Jinja2 reference cases cover developer examples, all extraction modes,
+thinking, assistant output and validation errors. The HTTP prompt test also
+checks example/target image pixels and placement through this exact template.
+Regenerate the references with `python3 tests/fixtures/nuextract/generate.py`
+using Jinja2 3.1.6; normal C++ tests do not require Python Jinja2.
 
 Live model checks belong in [tests/functional](../tests/functional/README.md#gguf-jinja-templates).
 Compare prompts against independent Hugging Face fixtures and run inference

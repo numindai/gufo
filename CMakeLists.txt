@@ -690,6 +690,7 @@ if (BUILD_TESTING)
     src/cli/serve/jinja_prompt.cpp)
   target_link_libraries(jinja_chat_template_test PRIVATE gufo_core)
   target_compile_definitions(jinja_chat_template_test PRIVATE
+    GUFO_NUEXTRACT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/nuextract"
     GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/reference/chat_template.jinja"
     GUFO_CHAT_TEMPLATE_HF_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
   add_test(NAME jinja_chat_template_test COMMAND jinja_chat_template_test)
