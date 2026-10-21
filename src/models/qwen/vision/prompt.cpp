@@ -260,6 +260,19 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       &content_spans);
   if (!rendered)
     throw std::invalid_argument(error);
+  return PrepareRendered(tokenizer, messages, *rendered, offsets,
+                         encoder_identity, max_context, content_spans,
+                         stable_prefix_bytes);
+}
+
+Prompt PrepareRendered(const tokenization::QwenTokenizer& tokenizer,
+                       std::span<const tokenization::ChatMessage> messages,
+                       std::string_view rendered,
+                       std::span<const std::size_t> offsets,
+                       std::string_view encoder_identity,
+                       std::uint32_t max_context,
+                       std::span<const tokenization::ContentSpan> content_spans,
+                       std::optional<std::size_t> stable_prefix_bytes) {
   Prompt prompt;
   tokenization::TokenizerOptions tok_options;
   tok_options.add_bos = false;
@@ -267,7 +280,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   tok_options.parse_special_tokens = true;
   const auto append = [&](std::size_t begin, std::size_t end) {
     auto tokens = tokenization::QwenChatTemplate::EncodeRendered(
-        tokenizer, *rendered, begin, end, content_spans, tok_options);
+        tokenizer, rendered, begin, end, content_spans, tok_options);
     if (tokens.size() > max_context - prompt.tokens.size()) {
       throw std::length_error(
           "prompt exceeds the " + std::to_string(max_context) +
@@ -292,6 +305,12 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       }
       if (index >= offsets.size())
         throw std::logic_error("image rendering lost a part");
+      if (offsets[index] < cursor || offsets[index] > rendered.size() ||
+          rendered.substr(offsets[index], tokenization::kImagePad.size()) !=
+              tokenization::kImagePad)
+        throw std::invalid_argument("invalid rendered image placeholder");
+      if (!image.bytes)
+        throw std::invalid_argument("image input has no bytes");
       append(cursor, offsets[index]);
       auto pixels = ResizeImage(core::DecodeImage(*image.bytes));
       const ImageGrid grid{static_cast<std::uint32_t>(prompt.tokens.size()),
@@ -311,17 +330,22 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       cursor = offsets[index++] + tokenization::kImagePad.size();
     }
   }
-  append(cursor, rendered->size());
+  if (index != offsets.size())
+    throw std::invalid_argument("rendered image placeholders exceed images");
+  append(cursor, rendered.size());
   // The boundary starts a special token (the assistant turn, or a final user
   // turn an agent replaces each request), after every image.
   // Encode only the mutable suffix; never decode or resize images twice.
-  const auto suffix = tokenization::QwenChatTemplate::EncodeRendered(
-      tokenizer, *rendered, stable_prefix_bytes, rendered->size(),
-      content_spans, tok_options);
-  if (suffix.size() > prompt.tokens.size() ||
-      !std::ranges::equal(suffix, std::span(prompt.tokens).last(suffix.size())))
-    throw std::logic_error("Qwen stable prefix is not a token boundary");
-  prompt.stable_prefix_tokens = prompt.tokens.size() - suffix.size();
+  if (stable_prefix_bytes) {
+    const auto suffix = tokenization::QwenChatTemplate::EncodeRendered(
+        tokenizer, rendered, *stable_prefix_bytes, rendered.size(),
+        content_spans, tok_options);
+    if (suffix.size() > prompt.tokens.size() ||
+        !std::ranges::equal(suffix,
+                            std::span(prompt.tokens).last(suffix.size())))
+      throw std::logic_error("Qwen stable prefix is not a token boundary");
+    prompt.stable_prefix_tokens = prompt.tokens.size() - suffix.size();
+  }
   prompt.rope.Validate(max_context);
   if (!prompt.images.empty()) {
     const auto digest = identity.Finish();

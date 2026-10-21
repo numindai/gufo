@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Manual GGUF Jinja HTTP checks using independent HF prompt/token fixtures.
 
-Each fixture contains name, context, expected_token_ids and expected_output.
+Each fixture contains name, context, expected_token_ids and expected_output
+(JSON), or expected_text for exact non-JSON output.
 Optional stream, expect_status and error_contains exercise protocol failures.
 Run against an already started Gufo server; this script never downloads models.
 """
@@ -89,13 +90,18 @@ def main():
                 result["text"] = text
                 result["usage"] = response["usage"]
                 result["timings"] = response["usage"]["gufo"]
-                assert json.loads(text) == fixture["expected_output"], text
+                if "expected_text" in fixture:
+                    assert text.strip() == fixture["expected_text"], text
+                else:
+                    assert json.loads(text) == fixture["expected_output"], text
                 assert response["usage"]["prompt_tokens"] == len(fixture["expected_token_ids"]), response
                 cached = response["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
                 if fixture.get("expect_cached"):
                     assert cached > 0, response
                 if fixture.get("cache_prompt") is False:
                     assert cached == 0, response
+                if "max_cached_tokens" in fixture:
+                    assert cached <= fixture["max_cached_tokens"], response
                 if fixture.get("expect_reasoning"):
                     assert result.get("reasoning"), response
                 assert response["usage"]["gufo"]["prefill_tokens"] == response["usage"]["prompt_tokens"] - cached, response

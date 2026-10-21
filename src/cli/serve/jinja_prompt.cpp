@@ -31,12 +31,62 @@ void CheckLiteralInput(const json::Value& value,
   }
 }
 
+json::Value ImageContent(const tokenization::ChatMessage& message,
+                         json::Value content) {
+  if (message.images.empty())
+    return content;
+  const auto image_part = [] {
+    auto part = json::Value::object();
+    part["type"] = "image";
+    part["image"] = "";
+    return part;
+  };
+  if (content.is_array()) {
+    // HF processors pass image parts, not OpenAI image_url transport objects.
+    // Pixels stay in ChatMessage::images, outside the template context.
+    std::size_t count = 0;
+    auto parts = json::Value::array();
+    for (const auto& part : content.items()) {
+      if (part.member_str("type") == "image_url") {
+        parts.push_back(image_part());
+        ++count;
+      } else {
+        parts.push_back(part);
+      }
+    }
+    if (count != message.images.size())
+      throw JinjaPromptError(
+          "Jinja image content does not match decoded images");
+    return parts;
+  }
+  content = json::Value::array();
+  std::size_t cursor = 0;
+  const auto text_part = [&](std::size_t end) {
+    if (end > cursor) {
+      auto part = json::Value::object();
+      part["type"] = "text";
+      part["text"] = message.content.substr(cursor, end - cursor);
+      content.push_back(std::move(part));
+    }
+    cursor = end;
+  };
+  for (const auto& image : message.images) {
+    if (image.offset < cursor || image.offset > message.content.size())
+      throw JinjaPromptError("invalid Jinja image content offset");
+    text_part(image.offset);
+    content.push_back(image_part());
+  }
+  text_part(message.content.size());
+  return content;
+}
+
 }  // namespace
 
 std::string RenderJinjaPrompt(const core::JinjaChatTemplate& renderer,
                               const ChatRequest& request,
                               const tokenization::QwenTokenizer& tokenizer,
-                              std::size_t max_output_bytes) {
+                              std::size_t max_output_bytes,
+                              std::vector<std::size_t>* image_offsets) {
   if (!request.tools.empty())
     throw JinjaPromptError("GGUF Jinja HTTP tool calling is not supported");
   if (!request.chat_template_kwargs.is_object())
@@ -44,11 +94,12 @@ std::string RenderJinjaPrompt(const core::JinjaChatTemplate& renderer,
   auto context = request.chat_template_kwargs;
   CheckLiteralInput(context, tokenizer);
   auto messages = json::Value::array();
+  std::size_t image_count = 0;
   for (const auto& message : request.messages) {
-    if (!message.images.empty() || !message.tool_calls.empty() ||
+    if (!message.tool_calls.empty() ||
         message.role == tokenization::ChatRole::kTool)
-      throw JinjaPromptError(
-          "GGUF Jinja HTTP supports text messages without tools or images");
+      throw JinjaPromptError("GGUF Jinja HTTP tool calling is not supported");
+    image_count += message.images.size();
     auto item = json::Value::object();
     item["role"] = message.role == tokenization::ChatRole::kDeveloper
                        ? "developer"
@@ -57,6 +108,7 @@ std::string RenderJinjaPrompt(const core::JinjaChatTemplate& renderer,
                        ? json::Value(message.content)
                        : json::parse(message.content_parts_json);
     CheckLiteralInput(content, tokenizer);
+    content = ImageContent(message, std::move(content));
     if (!message.framing_suffix.empty()) {
       if (content.is_array()) {
         auto suffix = json::Value::object();
@@ -82,6 +134,8 @@ std::string RenderJinjaPrompt(const core::JinjaChatTemplate& renderer,
   context["messages"] = std::move(messages);
   context["tools"] = json::Value::array();
   context["add_generation_prompt"] = true;
+  if (request.add_vision_id)
+    context["add_vision_id"] = true;
   if (request.reasoning.enabled)
     context["enable_thinking"] = *request.reasoning.enabled;
   if (request.reasoning.preserve_thinking)
@@ -96,7 +150,31 @@ std::string RenderJinjaPrompt(const core::JinjaChatTemplate& renderer,
   auto rendered = renderer.Render(context, &error, max_output_bytes);
   if (!rendered)
     throw JinjaPromptError(error);
+  std::vector<std::size_t> offsets;
+  for (std::size_t pos = 0; (pos = rendered->find(tokenization::kImagePad,
+                                                  pos)) != std::string::npos;
+       pos += tokenization::kImagePad.size())
+    offsets.push_back(pos);
+  if (offsets.size() != image_count)
+    throw JinjaPromptError(
+        "GGUF Jinja template must render one image placeholder per input image "
+        "in conversation order");
+  if (image_offsets)
+    *image_offsets = std::move(offsets);
   return std::move(*rendered);
+}
+
+models::qwen::vision::Prompt PrepareJinjaPrompt(
+    const core::JinjaChatTemplate& renderer, const ChatRequest& request,
+    const tokenization::QwenTokenizer& tokenizer,
+    std::string_view encoder_identity, std::uint32_t max_context,
+    std::size_t max_output_bytes) {
+  std::vector<std::size_t> offsets;
+  const auto rendered = RenderJinjaPrompt(renderer, request, tokenizer,
+                                          max_output_bytes, &offsets);
+  return models::qwen::vision::PrepareRendered(tokenizer, request.messages,
+                                               rendered, offsets,
+                                               encoder_identity, max_context);
 }
 
 TextGenerationBackend::InitialOutputState JinjaOutputState(

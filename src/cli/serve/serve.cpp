@@ -623,8 +623,8 @@ void PrintServeHelp(std::string_view program_name,
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
     parser.AddFlag("", "--jinja",
-                   "Use the GGUF Jinja chat template (text only; default: off)",
-                   "Model", &use_jinja);
+                   "Use the GGUF Jinja chat template (default: off)", "Model",
+                   &use_jinja);
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API", "Model",
                      &served_model_name);
@@ -1163,10 +1163,9 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
-    llm_parser.AddFlag(
-        "", "--jinja",
-        "Use the GGUF Jinja chat template (text only; default: off)", "Model",
-        &use_jinja);
+    llm_parser.AddFlag("", "--jinja",
+                       "Use the GGUF Jinja chat template (default: off)",
+                       "Model", &use_jinja);
     llm_parser.AddOption("", "--served-model-name", "ID",
                          "Model identifier exposed by the OpenAI API", "Model",
                          &served_model_name);

@@ -392,6 +392,17 @@ Negative cases use `expect_status`, `error_contains` and optional `error_code`;
 CI. Custom templates previously rejected at load have no matching HTTP timing
 baseline; report their timings without a comparative performance claim.
 
+For image fixtures, start the server with the model's matching `--mmproj`
+BF16 sidecar and use `image_url` parts (including data URLs) in the messages.
+Generate reference token IDs with the Hugging Face processor, including visual
+token expansion, rather than the tokenizer alone. Cover image-only and mixed
+text/image inputs, multiple images, streaming, cache-disabled requests, repeated
+images and changed pixels with identical dimensions. Include an extraction whose
+values exist only in the image. For changed pixels, set `max_cached_tokens` to
+the first changed image's token offset to reject reuse across that image.
+`expected_text` can replace `expected_output`
+for exact non-JSON content extraction checks.
+
 Also start the same custom artifact without `--jinja`: its unrecognized
 template must still fail default validation. Retain the startup logs for both
 runs, including the context limit and renderer selection. See the

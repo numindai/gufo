@@ -65,6 +65,12 @@ template. For NuExtract this includes `template`, `instructions`, `mode` and
 
 - Message order and `developer` roles are preserved. Text content arrays keep
   their boundaries, including the separate parts used by in-context examples.
+- Images are supported with the model's matching `--mmproj` BF16 sidecar.
+  Send standard `image_url` content parts alongside text. The adapter converts
+  them to Hugging Face `image` parts; the embedded template must emit one
+  `<|image_pad|>` per image, in conversation order. Gufo expands each placeholder
+  to the resized image's visual tokens and supplies its embeddings and position
+  layout. Missing or extra placeholders are rejected instead of dropping images.
 - Omitted template variables remain undefined so the template can choose its
   defaults. Explicit server reasoning defaults and request reasoning controls
   follow the existing [reasoning contract](SERVER.md#reasoning-controls).
@@ -74,7 +80,7 @@ template. For NuExtract this includes `template`, `instructions`, `mode` and
 - Buffered and streaming responses use the same rendered prompt. Set
   `"stream": true` for streaming and `"stream_options": {"include_usage": true}`
   for final usage.
-- Images, tool declarations, tool calls and tool-result messages are unsupported
+- Tool declarations, tool calls and tool-result messages are unsupported
   by this HTTP adapter. The reusable renderer has a separate, broader contract
   below.
 - Request strings and object keys must not contain model control-token
@@ -91,6 +97,8 @@ compiled-template turn boundaries from custom Jinja, so it does not request
 the compiled formatter's additional stable-boundary checkpoint. Persistent
 cache identities distinguish the two renderers. Changing template variables
 can change the rendered prefix and reduce cache reuse.
+Image cache identities include decoded pixels, image placement and the projector;
+changing an image cannot reuse an incompatible image prefix.
 
 This request contract is for Chat Completions. It does not extend the
 Responses or Anthropic Messages APIs with model-specific template kwargs.

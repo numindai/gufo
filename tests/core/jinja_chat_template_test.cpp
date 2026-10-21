@@ -1,11 +1,13 @@
 #include "src/core/jinja_chat_template.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <future>
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "src/cli/serve/jinja_prompt.hpp"
@@ -279,10 +281,147 @@ void TestHttpAdapter() {
          "Earlier turns do not determine the output state");
 }
 
+void TestHttpImages() {
+  using namespace gufo::server;
+  using namespace gufo::tokenization;
+  std::vector<std::string> vocabulary;
+  for (int i = 0; i < 256; ++i)
+    vocabulary.emplace_back(1, static_cast<char>(i));
+  std::unordered_map<std::string, TokenId> specials;
+  for (const auto* token : {"<|im_start|>", "<|im_end|>", "<|vision_start|>",
+                            "<|vision_end|>", "<|image_pad|>"}) {
+    specials[token] = vocabulary.size();
+    vocabulary.emplace_back(token);
+  }
+  const auto tokenizer =
+      QwenTokenizer::CreateFromVocabulary(vocabulary, {}, specials);
+  Expect(tokenizer != nullptr, "Image test tokenizer loads");
+  const auto renderer = Compile(Read(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE));
+  const auto red = std::make_shared<const std::vector<std::uint8_t>>(
+      gufo::core::ReadImageUrl(
+          "data:image/png;base64,"
+          "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAMklEQVR4nGP4z8BAU0Rb"
+          "00ctGA2i0VQ0mg9Gi4rR0nS0PhitMkdbFaPtotGm43/"
+          "q5QMAMsP8LqKijEUAAAAASUVORK5CYII="));
+  const auto blue = std::make_shared<const std::vector<std::uint8_t>>(
+      gufo::core::ReadImageUrl(
+          "data:image/png;base64,"
+          "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAMElEQVR4nGNgYPhPYzRq"
+          "wWgQjaai0XwwWlSMlqaj9cFolTnaqhhtF402Hf8PjXwAADpL/"
+          "C4CLyDsAAAAAElFTkSuQmCC"));
+  ChatRequest request;
+  request.reasoning.enabled = false;
+  request.messages.emplace_back(ChatRole::kUser, "beforeafter");
+  auto& message = request.messages.back();
+  message.images = {{6, red}, {6, blue}};
+  message.content_parts_json = R"([
+    {"type":"text","text":"before"},
+    {"type":"image_url","image_url":{"url":"red"}},
+    {"type":"image_url","image_url":{"url":"blue"}},
+    {"type":"text","text":"after"}])";
+  const std::string expected =
+      "<|im_start|>user\nbefore<|vision_start|><|image_pad|><|vision_end|>"
+      "<|vision_start|><|image_pad|><|vision_end|>after<|im_end|>\n"
+      "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+  Expect(RenderJinjaPrompt(*renderer, request, *tokenizer, 4096) == expected,
+         "Image parts retain interleaved text and adjacent image order");
+  const auto prepare = [&](const auto& source,
+                           std::string_view encoder = "test",
+                           std::uint32_t limit = 4096) {
+    return PrepareJinjaPrompt(source, request, *tokenizer, encoder, limit,
+                              4096);
+  };
+  const auto prompt = prepare(*renderer);
+  auto expected_tokens =
+      tokenizer->Encode("<|im_start|>user\nbefore<|vision_start|>");
+  const auto first_offset = expected_tokens.size();
+  expected_tokens.insert(expected_tokens.end(), 64, 248056);
+  auto middle = tokenizer->Encode("<|vision_end|><|vision_start|>");
+  expected_tokens.insert(expected_tokens.end(), middle.begin(), middle.end());
+  const auto second_offset = expected_tokens.size();
+  expected_tokens.insert(expected_tokens.end(), 64, 248056);
+  auto suffix = tokenizer->Encode(
+      "<|vision_end|>after<|im_end|>\n"
+      "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+  expected_tokens.insert(expected_tokens.end(), suffix.begin(), suffix.end());
+  Expect(prompt.tokens == expected_tokens,
+         "Each resized 256x256 image expands to 64 language image tokens");
+  Expect(prompt.images.size() == 2 &&
+             prompt.images[0].grid.offset == first_offset &&
+             prompt.images[1].grid.offset == second_offset &&
+             prompt.images[0].grid.height == 8 &&
+             prompt.images[0].grid.width == 8 &&
+             prompt.images[0].pixels.pixels[0] == 255 &&
+             prompt.images[1].pixels.pixels[2] == 255,
+         "Image pixels and grid offsets follow placeholder order");
+  Expect(prompt.stable_prefix_tokens == 0 &&
+             prompt.cache_identity.size() == 32 &&
+             prompt.IdentityForPrefix(first_offset).empty() &&
+             !prompt.IdentityForPrefix(first_offset + 1).empty(),
+         "Jinja keeps image-aware cache identities without guessing a stable "
+         "boundary");
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  const auto compiled = gufo::models::qwen::vision::Prepare(
+      *tokenizer, request.messages, {}, options, "test", 4096);
+  Expect(prompt.tokens == compiled.tokens && prompt.rope == compiled.rope &&
+             prompt.cache_identity == compiled.cache_identity,
+         "Reference Jinja and compiled prompts agree on expanded tokens, "
+         "positions and pixels");
+  Expect(prepare(*renderer).cache_identity == prompt.cache_identity &&
+             prepare(*renderer, "other-projector").cache_identity !=
+                 prompt.cache_identity,
+         "Image cache identity is repeatable and projector-specific");
+  std::swap(message.images[0].bytes, message.images[1].bytes);
+  const auto swapped = prepare(*renderer);
+  Expect(
+      swapped.tokens == prompt.tokens &&
+          swapped.cache_identity != prompt.cache_identity,
+      "Different image pixels cannot reuse an identical token-only cache key");
+  std::swap(message.images[0].bytes, message.images[1].bytes);
+  message.content_parts_json.clear();
+  Expect(prepare(*renderer).tokens == prompt.tokens,
+         "Internal image offsets reconstruct the same ordered content parts");
+  request.add_vision_id = true;
+  Expect(RenderJinjaPrompt(*renderer, request, *tokenizer, 4096)
+                 .find("Picture 2: <|vision_start|>") != std::string::npos,
+         "Vision numbering reaches the embedded template");
+  request.add_vision_id = false;
+  const auto rejects = [&](const auto& source,
+                           std::string_view encoder = "test",
+                           std::uint32_t limit = 4096) {
+    try {
+      (void)prepare(source, encoder, limit);
+    } catch (const std::exception&) {
+      return true;
+    }
+    return false;
+  };
+  Expect(rejects(*renderer, ""), "Images require a matching projector");
+  Expect(rejects(*renderer, "test", 64),
+         "Expanded images obey the context limit");
+  Expect(rejects(*Compile("no images")),
+         "Templates cannot silently discard images");
+  Expect(rejects(*Compile("<|image_pad|><|image_pad|><|image_pad|>")),
+         "Templates cannot invent or duplicate image placeholders");
+  message.content = "<|image_pad|>";
+  message.images = {{0, red}};
+  Expect(rejects(*renderer),
+         "Image requests cannot inject image control tokens");
+  message.content.clear();
+  Expect(prepare(*renderer).images.size() == 1,
+         "Image-only content is supported");
+  request.messages.emplace_back(ChatRole::kUser, "second");
+  request.messages.back().images = {{0, blue}};
+  Expect(prepare(*renderer).images.size() == 2,
+         "Images across message history are supported");
+}
+
 }  // namespace
 
 int main() {
   TestHttpAdapter();
+  TestHttpImages();
   TestGgufAndContext();
   TestErrorsAndIsolation();
   TestReplaceFilter();

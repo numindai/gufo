@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -64,6 +65,17 @@ struct Prompt {
     std::span<const tokenization::ChatTool> tools,
     const tokenization::ChatTemplateOptions& options,
     std::string_view encoder_identity, std::uint32_t max_context);
+
+/// Expand one image-pad placeholder per image in conversation order. The
+/// caller owns rendering and supplies sorted byte offsets into that rendering.
+/// Custom templates omit stable_prefix_bytes when no stable boundary is known.
+[[nodiscard]] Prompt PrepareRendered(
+    const tokenization::QwenTokenizer& tokenizer,
+    std::span<const tokenization::ChatMessage> messages,
+    std::string_view rendered, std::span<const std::size_t> image_offsets,
+    std::string_view encoder_identity, std::uint32_t max_context,
+    std::span<const tokenization::ContentSpan> content_spans = {},
+    std::optional<std::size_t> stable_prefix_bytes = std::nullopt);
 
 }  // namespace gufo::models::qwen::vision
 #endif

@@ -87,7 +87,14 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
 std::optional<std::size_t> CountQwenPromptTokens(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context) {
+    std::uint32_t max_context, const core::JinjaChatTemplate* jinja = nullptr) {
+  if (jinja)
+    return PrepareJinjaPrompt(
+               *jinja, request, tokenizer,
+               encoder ? encoder->identity() : std::string_view{},
+               std::numeric_limits<std::int32_t>::max(),
+               tokenization::RenderedPromptBoundBytes(max_context))
+        .tokens.size();
   const auto options = QwenChatOptions(request, max_context);
   const auto tools =
       request.tool_choice == ChatRequest::ToolChoice::kNone
@@ -115,19 +122,21 @@ std::optional<std::size_t> CountQwenPromptTokens(
 TextPreparedPrompt PrepareQwenPrompt(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context) {
+    std::uint32_t max_context, const core::JinjaChatTemplate* jinja = nullptr) {
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
   const auto options = QwenChatOptions(request, max_context);
+  const auto encoder_identity =
+      encoder && has_images ? encoder->identity() : std::string_view{};
   auto prompt = std::make_shared<models::qwen::vision::Prompt>(
-      models::qwen::vision::Prepare(
-          tokenizer, request.messages,
-          request.tool_choice == ChatRequest::ToolChoice::kNone
-              ? std::span<const tokenization::ChatTool>{}
-              : std::span<const tokenization::ChatTool>{request.tools},
-          options,
-          encoder && has_images ? encoder->identity() : std::string_view{},
-          max_context));
+      jinja ? PrepareJinjaPrompt(*jinja, request, tokenizer, encoder_identity,
+                                 max_context, options.max_output_bytes)
+            : models::qwen::vision::Prepare(
+                  tokenizer, request.messages,
+                  request.tool_choice == ChatRequest::ToolChoice::kNone
+                      ? std::span<const tokenization::ChatTool>{}
+                      : std::span<const tokenization::ChatTool>{request.tools},
+                  options, encoder_identity, max_context));
   const auto cache_prefix = prompt->stable_prefix_tokens;
   if (prompt->images.empty())
     return {std::move(prompt->tokens), {}, cache_prefix};
@@ -300,7 +309,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
            << "chat_template="
-           << (jinja ? "gguf-minja-http-v1" : "qwen38-reasoning-compiled-v3")
+           << (jinja ? "gguf-minja-http-v2" : "qwen38-reasoning-compiled-v3")
            << '\n'
            << "chat_template_reference_sha256="
            << (jinja ? "embedded-in-artifact"
@@ -1110,9 +1119,13 @@ public:
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
     if (jinja_)
-      return model_->GetTokenizer().Encode(RenderJinjaPrompt(
-          *jinja_, request, model_->GetTokenizer(),
-          tokenization::RenderedPromptBoundBytes(max_context_)));
+      return PrepareJinjaPrompt(
+                 *jinja_, request, model_->GetTokenizer(),
+                 model_->VisionEncoder() ? model_->VisionEncoder()->identity()
+                                         : std::string_view{},
+                 max_context_,
+                 tokenization::RenderedPromptBoundBytes(max_context_))
+          .tokens;
     return tokenization::QwenChatTemplate::RenderAndTokenize(
         model_->GetTokenizer(), request.messages,
         request.tool_choice == ChatRequest::ToolChoice::kNone
@@ -1123,20 +1136,16 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
-    if (jinja_) {
-      auto tokens = RenderAndTokenize(request);
-      return TextPreparedPrompt{std::move(*tokens), {}, 0};
-    }
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
-                             model_->VisionEncoder(), max_context_);
+                             model_->VisionEncoder(), max_context_,
+                             jinja_.get());
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
-    if (jinja_)
-      return RenderAndTokenize(request)->size();
     return CountQwenPromptTokens(request, model_->GetTokenizer(),
-                                 model_->VisionEncoder(), max_context_);
+                                 model_->VisionEncoder(), max_context_,
+                                 jinja_.get());
   }
 
   void SetPromptContext(
@@ -3671,8 +3680,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
-    new_state->supports_images =
-        model->VisionEncoder() != nullptr && !use_jinja;
+    new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(drafts), speculative_options,
         disk_cache_config.model_artifact_fingerprint,
