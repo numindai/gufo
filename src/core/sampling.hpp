@@ -31,6 +31,8 @@ struct SamplingConfig {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   std::shared_ptr<const TokenConstraint> constraint;
+  bool logprobs{false};
+  std::size_t top_logprobs{0};
 
   void Validate() const;
 
@@ -50,6 +52,18 @@ struct Probability {
   TokenId token{0};
   double value{0.0};
 };
+
+struct TokenLogprobs {
+  double logprob{0.0};
+  std::vector<Probability> top{};  // Values are natural log probabilities.
+};
+
+/// Full-vocabulary model log-softmax, before sampling penalties and filters.
+/// Reporting must not consume RNG or turn greedy predictions into
+/// probability 1.
+[[nodiscard]] TokenLogprobs ComputeLogprobs(std::span<const float> logits,
+                                            TokenId token,
+                                            std::size_t top_count);
 
 /// A normalized, post-filter sampling distribution.
 class SamplingDistribution {

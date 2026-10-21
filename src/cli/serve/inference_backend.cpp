@@ -739,6 +739,18 @@ public:
     return result;
   }
 
+  void AdvanceAutoregressive(TextRunnerToken token) {
+    const auto next = verifier_ != nullptr
+                          ? verifier_->AdvanceCommittedToken(
+                                token, static_cast<std::uint32_t>(position_))
+                          : executor_->ForwardToken(
+                                token, static_cast<std::uint32_t>(position_));
+    if (verifier_ != nullptr)
+      sequence_.push_back(token);
+    ++position_;
+    set_frontier(next);
+  }
+
   [[nodiscard]] hip::QwenGpuExecutor& executor() const { return *executor_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
@@ -1250,7 +1262,11 @@ public:
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qwen = RequireQwenState(state);
-    const TextRunnerToken token = qwen.SelectFrontier(sampler);
+    const auto logits = sampler.config().logprobs ? qwen.CopyFrontierLogits()
+                                                  : std::vector<float>{};
+    const TextRunnerToken token = sampler.config().logprobs
+                                      ? sampler.Sample(logits)
+                                      : qwen.SelectFrontier(sampler);
     if (EndsTurn(qwen, model_->GetTokenizer(), token)) {
       return {
           .stop = true,
@@ -1265,22 +1281,19 @@ public:
         .stop = false,
         .token = token,
         .piece = std::string(model_->GetTokenizer().DecodeToken(token)),
+        .logprob = sampler.config().logprobs
+                       ? std::optional(DescribeLogprobs(
+                             logits, token, sampler.config().top_logprobs))
+                       : std::nullopt,
     };
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     auto& qwen = RequireQwenState(state);
-    if (qwen.speculative()) {
-      throw std::logic_error(
-          "Qwen DFlash decoding requires a multi-token decode step");
-    }
     if (!qwen.frontier().has_value()) {
       throw std::logic_error("Qwen decode state has no retained frontier");
     }
-    const auto frontier = qwen.executor().ForwardToken(
-        token, static_cast<std::uint32_t>(qwen.position()));
-    qwen.set_position(qwen.position() + 1);
-    qwen.set_frontier(frontier);
+    qwen.AdvanceAutoregressive(token);
   }
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
@@ -1292,7 +1305,7 @@ public:
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
     auto& qwen = RequireQwenState(state);
-    if (!qwen.speculative()) {
+    if (!qwen.speculative() || sampler.config().logprobs) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     return qwen.DecodeSpeculative(max_tokens, sampler);
@@ -1300,7 +1313,11 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (!drafts_.Enabled() || decodes.size() < 2 ||
+    if (std::ranges::any_of(decodes,
+                            [](const auto& decode) {
+                              return decode.sampler.get().config().logprobs;
+                            }) ||
+        !drafts_.Enabled() || decodes.size() < 2 ||
         decodes.size() > MaximumDecodeBatchWidth()) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -2031,6 +2048,7 @@ public:
     if (deepseek.position() >= max_context_)
       return {.stop = true, .piece = {}};
     // A sampled DSpark cycle may have drawn the next token already.
+    std::vector<float> probability_logits;
     int token = deepseek.session().TakePendingDsparkToken();
     if (token < 0) {
       std::string error;
@@ -2039,6 +2057,8 @@ public:
         throw std::runtime_error("DeepSeek token selection failed: " + error);
       }
       token = static_cast<int>(sampler.Sample(logits));
+      if (sampler.config().logprobs)
+        probability_logits.assign(logits.begin(), logits.end());
     }
     if (deepseek.stop_at_eos() && model_->IsStopToken(token)) {
       return {
@@ -2051,6 +2071,11 @@ public:
         .stop = false,
         .token = static_cast<TextRunnerToken>(token),
         .piece = model_->DecodeToken(token),
+        .logprob =
+            sampler.config().logprobs
+                ? std::optional(DescribeLogprobs(probability_logits, token,
+                                                 sampler.config().top_logprobs))
+                : std::nullopt,
     };
   }
 
@@ -2081,13 +2106,17 @@ public:
                 model_->IsStopToken(static_cast<int>(token)),
         .token = token,
         .piece = model_->DecodeToken(static_cast<int>(token)),
+        .logprob = sampler.config().logprobs
+                       ? std::optional(DescribeLogprobs(
+                             logits, token, sampler.config().top_logprobs))
+                       : std::nullopt,
     };
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
-    if (!use_dspark_) {
+    if (!use_dspark_ || sampler.config().logprobs) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -2142,7 +2171,11 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (!use_dspark_ || decodes.size() < 2 || decodes.size() > 8) {
+    if (std::ranges::any_of(decodes,
+                            [](const auto& decode) {
+                              return decode.sampler.get().config().logprobs;
+                            }) ||
+        !use_dspark_ || decodes.size() < 2 || decodes.size() > 8) {
       return TextModelRunner::DecodeBatch(decodes);
     }
     if (std::any_of(decodes.begin(), decodes.end(), [&](const auto& item) {
@@ -2885,6 +2918,10 @@ public:
         .stop = false,
         .token = static_cast<TextRunnerToken>(token),
         .piece = model_->TokenText(token),
+        .logprob = sampler.config().logprobs
+                       ? std::optional(DescribeLogprobs(
+                             logits, token, sampler.config().top_logprobs))
+                       : std::nullopt,
     };
   }
 
@@ -2910,7 +2947,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
-    if (!use_mtp_ || max_tokens == 1) {
+    if (!use_mtp_ || max_tokens == 1 || sampler.config().logprobs) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -2987,7 +3024,11 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (decodes.size() < 2 || !use_mtp_) {
+    if (std::ranges::any_of(decodes,
+                            [](const auto& decode) {
+                              return decode.sampler.get().config().logprobs;
+                            }) ||
+        decodes.size() < 2 || !use_mtp_) {
       return TextModelRunner::DecodeBatch(decodes);
     }
     const auto count = decodes.size();

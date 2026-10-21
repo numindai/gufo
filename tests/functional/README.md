@@ -361,6 +361,16 @@ parity. Sampled DSpark may differ across concurrency levels; fixed-path replay
 and greedy equality remain checked. API behavior and references are in
 [SERVER.md](../../docs/SERVER.md).
 
+## Token log probabilities
+
+Select `--suite logprobs` to validate the official SDK's buffered and streaming
+Chat Completions logprob types, token-byte reconstruction, optional alternatives,
+greedy replay and zero draft work. Run against each affected model in AR and
+its configured speculative mode: logprob requests use target-only decoding in
+both modes. The suite retains responses and per-request timings through the
+standard recorder. Numerical normalization and extreme-logit checks live in
+`logit_sampler_test`; filter, Unicode and queue contracts have CPU tests.
+
 ## GGUF Jinja templates
 
 `jinja_http.py` checks the embedded GGUF template through `/v1/chat/completions`

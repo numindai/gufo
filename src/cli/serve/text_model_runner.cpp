@@ -506,6 +506,21 @@ void TextModelRunner::AdvanceBatch(
   }
 }
 
+TokenLogprob TextModelRunner::DescribeLogprobs(std::span<const float> logits,
+                                               TextRunnerToken token,
+                                               std::size_t top_count) const {
+  const auto probabilities =
+      sampling::ComputeLogprobs(logits, token, top_count);
+  TokenLogprob result{.token = Decode(std::span(&token, 1)),
+                      .logprob = probabilities.logprob};
+  for (const auto& alternative : probabilities.top) {
+    const TextRunnerToken id = alternative.token;
+    result.top_logprobs.push_back(
+        {Decode(std::span(&id, 1)), alternative.value});
+  }
+  return result;
+}
+
 TextDecodeStep TextModelRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {

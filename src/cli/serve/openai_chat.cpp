@@ -73,11 +73,15 @@ struct ParsedToolCall {
   std::vector<tokenization::ChatMessage::ToolArgument> arguments;
 };
 
+using ContentSpan =
+    std::pair<std::size_t, std::size_t>;  // Offset, length in decoded output.
+
 struct ParsedGeneration {
   std::string text;
   std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
   bool hide_tool_markup{false};
+  std::vector<ContentSpan> content_spans;
 };
 
 constexpr std::array<std::string_view, 7> kToolMarkers{
@@ -971,13 +975,30 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "request field 'ignore_eos' is not supported on this endpoint",
                  "unsupported_field");
   }
-  for (const std::string_view unsupported :
-       {"logprobs", "top_logprobs", "modalities", "audio"}) {
+  if (const auto* value = body.find("logprobs"); value && !value->is_null()) {
+    if (!value->is_bool())
+      return Error(400, "Bad Request", "logprobs must be a boolean",
+                   "invalid_logprobs");
+    output->sampling.logprobs = value->as_bool();
+  }
+  if (const auto* value = body.find("top_logprobs");
+      value && !value->is_null()) {
+    if (!value->is_number() || !std::isfinite(value->as_double()) ||
+        value->as_double() < 0 || value->as_double() > 20 ||
+        std::floor(value->as_double()) != value->as_double())
+      return Error(400, "Bad Request",
+                   "top_logprobs must be an integer between 0 and 20",
+                   "invalid_top_logprobs");
+    if (!output->sampling.logprobs)
+      return Error(400, "Bad Request", "top_logprobs requires logprobs: true",
+                   "invalid_top_logprobs");
+    output->sampling.top_logprobs =
+        static_cast<std::size_t>(value->as_double());
+  }
+  for (const std::string_view unsupported : {"modalities", "audio"}) {
     if (const auto* value = body.find(std::string(unsupported));
         value != nullptr && !value->is_null()) {
-      if ((unsupported == "logprobs" && value->is_bool() &&
-           !value->as_bool()) ||
-          (unsupported == "modalities" && value->is_array() &&
+      if ((unsupported == "modalities" && value->is_array() &&
            value->size() == 1 && value->items().front().is_string() &&
            value->items().front().str() == "text"))
         continue;
@@ -1927,6 +1948,9 @@ ParsedGeneration ParseGeneration(
     parsed.text = std::string(content);
   }
 
+  const auto content_offset = raw.size() - parsed.text.size();
+  if (!parsed.text.empty())
+    parsed.content_spans.emplace_back(content_offset, parsed.text.size());
   quotes.Reset(parsed.text);
   const std::size_t marker = EarliestMarker(parsed.text, markers, quotes);
   if (choice != ChatRequest::ToolChoice::kNone && !tools.empty() &&
@@ -1955,8 +1979,12 @@ ParsedGeneration ParseGeneration(
             reasoning_call_context.substr(end + kThinkEnd.size()),
             TextGenerationBackend::InitialOutputState::kContent, tools, choice,
             enforce_required, markers, closers, quotes);
+        for (auto& [offset, length] : parsed.content_spans)
+          offset += reasoning_call_context.data() - raw.data() + end +
+                    kThinkEnd.size();
       } else {
         parsed.text.clear();
+        parsed.content_spans.clear();
       }
       parsed.reasoning_content =
           std::string(reasoning_call_context.substr(0, end));
@@ -1972,11 +2000,20 @@ ParsedGeneration ParseGeneration(
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
       const std::string full = std::move(parsed.text);
-      std::string text(ContentBefore(full, 0, marker, closers, quotes, tools));
+      parsed.content_spans.clear();
+      std::string text;
+      const auto append = [&](std::string_view part) {
+        if (part.empty())
+          return;
+        parsed.content_spans.emplace_back(
+            content_offset + (part.data() - full.data()), part.size());
+        text += part;
+      };
+      append(ContentBefore(full, 0, marker, closers, quotes, tools));
       std::size_t cursor = marker;
       for (const auto& [begin, end] : spans) {
-        text += ContentBefore(full, cursor, marker + begin, closers, quotes,
-                              tools, cursor > marker);
+        append(ContentBefore(full, cursor, marker + begin, closers, quotes,
+                             tools, cursor > marker));
         cursor = marker + end;
       }
       if (!spans.empty()) {
@@ -1986,8 +2023,8 @@ ParsedGeneration ParseGeneration(
           if (const auto held =
                   HeldMarkerPrefix(full, full.size(), markers, quotes))
             unfinished = full.size() - held;
-        text += ContentBefore(full, cursor, unfinished, closers, quotes, tools,
-                              true);
+        append(ContentBefore(full, cursor, unfinished, closers, quotes, tools,
+                             true));
       }
       parsed.text = std::move(text);
       parsed.hide_tool_markup = true;
@@ -1996,8 +2033,13 @@ ParsedGeneration ParseGeneration(
     // No marker: the text is content, but the framing it carries still goes.
     // The streamed response drops it as the turn ends, and both transports
     // must report the same content.
-    parsed.text = std::string(ContentBefore(parsed.text, 0, parsed.text.size(),
-                                            closers, quotes, tools));
+    const auto part = ContentBefore(parsed.text, 0, parsed.text.size(), closers,
+                                    quotes, tools);
+    parsed.content_spans.clear();
+    if (!part.empty())
+      parsed.content_spans.emplace_back(
+          content_offset + (part.data() - parsed.text.data()), part.size());
+    parsed.text = std::string(part);
   }
   if (enforce_required && choice == ChatRequest::ToolChoice::kRequired &&
       parsed.tool_calls.empty())
@@ -2011,6 +2053,7 @@ ParsedGeneration ParseStructuredGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes) {
+  const auto original = raw;
   ParsedGeneration parsed;
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning) {
     if (raw.starts_with("<think>"))
@@ -2041,6 +2084,8 @@ ParsedGeneration ParseStructuredGeneration(
     auto native = ParseGeneration(
         content, TextGenerationBackend::InitialOutputState::kContent, tools,
         choice, enforce_required, markers, closers, quotes);
+    for (auto& [offset, length] : native.content_spans)
+      offset += content.data() - original.data();
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
@@ -2058,14 +2103,21 @@ ParsedGeneration ParseStructuredGeneration(
       (tool_only || content.starts_with(tool_start) ||
        ToolMarkerPrefix(content, markers))) {
     ParsedGeneration call;
+    const auto append = [&](std::string_view part) {
+      if (part.empty())
+        return;
+      call.content_spans.emplace_back(part.data() - original.data(),
+                                      part.size());
+      call.text += part;
+    };
     std::vector<std::pair<std::size_t, std::size_t>> spans;
     ParseQwenCalls(content, tools, &call.tool_calls,
                    tool_only ? &spans : nullptr);
     if (tool_only) {
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {
-        call.text += ContentBefore(content, cursor, begin, closers, quotes,
-                                   tools, cursor > 0);
+        append(ContentBefore(content, cursor, begin, closers, quotes, tools,
+                             cursor > 0));
         cursor = end;
       }
       const auto tail = content.substr(cursor);
@@ -2085,13 +2137,16 @@ ParsedGeneration ParseStructuredGeneration(
                                    : std::min(cursor + limit, content.size());
       // The model repeats the framing of the call it just made; that echo is
       // markup, not prose the client should replay on the next turn (#383).
-      call.text += ContentBefore(content, cursor, stop, closers, quotes, tools,
-                                 cursor > 0);
+      append(ContentBefore(content, cursor, stop, closers, quotes, tools,
+                           cursor > 0));
     }
     if (call.tool_calls.empty() && marker != std::string_view::npos &&
         quotes.UnclosedAt(marker) &&
         choice != ChatRequest::ToolChoice::kRequired) {
       parsed.text = std::string(raw);
+      if (!raw.empty())
+        parsed.content_spans.emplace_back(raw.data() - original.data(),
+                                          raw.size());
       return parsed;
     }
     call.hide_tool_markup = true;
@@ -2110,9 +2165,13 @@ ParsedGeneration ParseStructuredGeneration(
   // A constrained turn that produced no call is still reported without
   // framing: the streamed response drops it as the turn ends, and both
   // transports must report the same content.
-  parsed.text = tool_only ? std::string(ContentBefore(raw, 0, raw.size(),
-                                                      closers, quotes, tools))
-                          : std::string(raw);
+  const auto part =
+      tool_only ? ContentBefore(raw, 0, raw.size(), closers, quotes, tools)
+                : raw;
+  parsed.text = std::string(part);
+  if (!part.empty())
+    parsed.content_spans.emplace_back(part.data() - original.data(),
+                                      part.size());
   return parsed;
 }
 
@@ -2214,6 +2273,104 @@ std::string Sse(const json::Value& value) {
   return "data: " + value.dump() + "\n\n";
 }
 
+json::Value LogprobToken(std::string_view bytes, double probability) {
+  json::Value result = json::Value::object();
+  core::Utf8Decoder decoder;
+  result["token"] = decoder.Push(bytes, true);
+  result["logprob"] = probability;
+  result["bytes"] = json::Value::array();
+  for (const unsigned char byte : bytes)
+    result["bytes"].push_back(static_cast<int>(byte));
+  return result;
+}
+
+/// Carries original token bytes through UTF-8 repair and the content filter.
+/// Spans are explicit source positions, never text searches: repeated prose in
+/// reasoning or tool arguments must not acquire the answer's probabilities.
+class ChatLogprobs {
+public:
+  void Push(std::string_view text, std::span<const TokenLogprob> tokens,
+            bool final = false) {
+    tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
+    std::vector<core::Utf8Decoder::SourceSpan> spans;
+    const auto decoded = decoder_.Push(text, final, &spans);
+    for (auto span : spans) {
+      span.text_offset += decoded_size_;
+      if (!spans_.empty() && span.text_size == span.source_size &&
+          spans_.back().text_size == spans_.back().source_size &&
+          spans_.back().source_offset + spans_.back().source_size ==
+              span.source_offset) {
+        spans_.back().source_size += span.source_size;
+        spans_.back().text_size += span.text_size;
+      } else {
+        spans_.push_back(span);
+      }
+    }
+    decoded_size_ += decoded.size();
+  }
+
+  json::Value Content(std::span<const ContentSpan> content) const {
+    json::Value output = json::Value::object();
+    output["content"] = json::Value::array();
+    output["refusal"] = json::Value();
+    for (const auto& [offset, length] : content) {
+      if (length == 0)
+        continue;
+      const auto begin = SourceOffset(offset, false);
+      const auto end = SourceOffset(offset + length, true);
+      auto token =
+          std::lower_bound(tokens_.begin(), tokens_.end(), begin,
+                           [](const auto& item, std::size_t position) {
+                             return item.offset + item.token.size() <= position;
+                           });
+      std::size_t covered = begin;
+      for (; token != tokens_.end() && token->offset < end; ++token) {
+        const auto first = std::max(begin, token->offset);
+        const auto last = std::min(end, token->offset + token->token.size());
+        if (first == last)
+          continue;
+        if (first != covered)
+          throw std::runtime_error(
+              "missing token logprobs for generated content");
+        covered = last;
+        auto item =
+            LogprobToken(std::string_view(token->token)
+                             .substr(first - token->offset, last - first),
+                         token->logprob);
+        item["top_logprobs"] = json::Value::array();
+        for (const auto& alternative : token->top_logprobs)
+          item["top_logprobs"].push_back(
+              LogprobToken(alternative.token, alternative.logprob));
+        output["content"].push_back(std::move(item));
+      }
+      if (covered != end)
+        throw std::runtime_error(
+            "missing token logprobs for generated content");
+    }
+    return output;
+  }
+
+private:
+  std::size_t SourceOffset(std::size_t offset, bool end) const {
+    const auto span =
+        std::lower_bound(spans_.begin(), spans_.end(), offset,
+                         [end](const auto& item, std::size_t position) {
+                           const auto last = item.text_offset + item.text_size;
+                           return end ? last < position : last <= position;
+                         });
+    if (span == spans_.end())
+      throw std::runtime_error(
+          "logprobs content offset exceeds generated text");
+    if (span->source_size == span->text_size)
+      return span->source_offset + offset - span->text_offset;
+    return span->source_offset + (end ? span->source_size : 0);
+  }
+  core::Utf8Decoder decoder_;
+  std::size_t decoded_size_{0};
+  std::vector<core::Utf8Decoder::SourceSpan> spans_;
+  std::vector<TokenLogprob> tokens_;
+};
+
 json::Value BaseChunk(std::string_view id, long long created,
                       std::string_view model) {
   json::Value chunk = json::Value::object();
@@ -2226,12 +2383,15 @@ json::Value BaseChunk(std::string_view id, long long created,
 
 json::Value ChoiceChunk(std::string_view id, long long created,
                         std::string_view model, json::Value delta,
-                        const char* finish_reason = nullptr) {
+                        const char* finish_reason = nullptr,
+                        json::Value logprobs = {}) {
   json::Value chunk = BaseChunk(id, created, model);
   json::Value choices = json::Value::array();
   json::Value choice = json::Value::object();
   choice["index"] = 0;
   choice["delta"] = std::move(delta);
+  if (!logprobs.is_null())
+    choice["logprobs"] = std::move(logprobs);
   if (finish_reason == nullptr) {
     choice["finish_reason"] = json::Value();
   } else {
@@ -2244,8 +2404,8 @@ json::Value ChoiceChunk(std::string_view id, long long created,
 
 class StreamingTextFilter {
 public:
-  using EmitCallback =
-      std::function<bool(std::string_view piece, bool is_reasoning)>;
+  using EmitCallback = std::function<bool(
+      std::string_view piece, bool is_reasoning, std::size_t offset)>;
 
   StreamingTextFilter(
       TextGenerationBackend::InitialOutputState initial_output_state,
@@ -2388,7 +2548,9 @@ public:
             recognize_tools_
                 ? ContentBefore(raw_, offset, found, closers_, quotes_, tools_)
                 : std::string_view(pending_).substr(0, marker);
-        if (!prose.empty() && !Emit(prose, false)) {
+        if (!prose.empty() &&
+            !Emit(prose, false,
+                  static_cast<std::size_t>(prose.data() - raw_.data()))) {
           return false;
         }
         hidden_ = pending_.substr(marker);
@@ -2417,19 +2579,20 @@ public:
   }
 
   bool Finish(bool hide_tool_markup, std::string_view content = {},
-              std::string_view reasoning = {}) {
+              std::string_view reasoning = {},
+              std::span<const ContentSpan> spans = {}) {
     if (tool_mode_ && state_ == State::kThinking) {
       const auto tail = reasoning.substr(
           std::min(emitted_reasoning_bytes_, reasoning.size()));
       return (tail.empty() || Emit(tail, true)) &&
-             (content.empty() || Emit(content, false));
+             (content.empty() || EmitContent(content, 0, spans));
     }
     if (tool_only_ && tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
       // or after complete calls without exposing their markup or partial calls.
       const auto offset = std::min(emitted_content_bytes_, content.size());
       const auto tail = content.substr(offset);
-      return tail.empty() || Emit(tail, false);
+      return tail.empty() || EmitContent(content, offset, spans);
     }
     if (raw_content_ && !structured_started_ && hide_tool_markup) {
       pending_.clear();
@@ -2445,7 +2608,11 @@ public:
                                               closers_, quotes_, tools_)
                               : std::string_view(pending_);
         const bool is_reasoning = (state_ == State::kThinking);
-        const bool emitted = Emit(text, is_reasoning);
+        const auto source =
+            recognize_tools_ && state_ == State::kContent && !text.empty()
+                ? static_cast<std::size_t>(text.data() - raw_.data())
+                : offset;
+        const bool emitted = Emit(text, is_reasoning, source);
         pending_.clear();
         if (!emitted) {
           return false;
@@ -2454,7 +2621,7 @@ public:
       return true;
     }
     if (!hide_tool_markup && !hidden_.empty()) {
-      return Emit(hidden_, false);
+      return Emit(hidden_, false, raw_.size() - hidden_.size());
     }
     return true;
   }
@@ -2468,8 +2635,28 @@ public:
   }
 
 private:
-  bool Emit(std::string_view piece, bool reasoning) {
-    if (!emit_piece_(piece, reasoning))
+  bool EmitContent(std::string_view content, std::size_t skip,
+                   std::span<const ContentSpan> spans) {
+    if (spans.empty())
+      return Emit(content.substr(skip), false);
+    std::size_t cursor = 0;
+    for (const auto& [offset, length] : spans) {
+      if (cursor + length > skip) {
+        const auto begin = std::max(skip, cursor) - cursor;
+        if (!Emit(content.substr(cursor + begin, length - begin), false,
+                  offset + begin))
+          return false;
+      }
+      cursor += length;
+    }
+    return true;
+  }
+
+  bool Emit(std::string_view piece, bool reasoning,
+            std::size_t offset = std::string_view::npos) {
+    if (offset == std::string_view::npos)
+      offset = pending_offset();
+    if (!emit_piece_(piece, reasoning, offset))
       return false;
     if (reasoning)
       emitted_reasoning_bytes_ += piece.size();
@@ -2485,7 +2672,9 @@ private:
       if (start != std::string::npos) {
         const auto prose =
             ContentBefore(raw_, offset, found, closers_, quotes_, tools_);
-        if (!prose.empty() && !Emit(prose, false)) {
+        if (!prose.empty() &&
+            !Emit(prose, false,
+                  static_cast<std::size_t>(prose.data() - raw_.data()))) {
           return false;
         }
         emitted_content_bytes_ += prose.size();
@@ -2503,7 +2692,9 @@ private:
       if (ready) {
         const auto text = ContentBefore(raw_, offset, offset + ready, closers_,
                                         quotes_, tools_);
-        if (!text.empty() && !Emit(text, false)) {
+        if (!text.empty() &&
+            !Emit(text, false,
+                  static_cast<std::size_t>(text.data() - raw_.data()))) {
           return false;
         }
         emitted_content_bytes_ += text.size();
@@ -2523,8 +2714,9 @@ private:
         return true;
       }
     }
+    const auto offset = pending_offset();
     auto text = std::exchange(pending_, {});
-    return text.empty() || Emit(text, false);
+    return text.empty() || Emit(text, false, offset);
   }
   enum class State : std::uint8_t {
     kInitial,
@@ -2837,6 +3029,12 @@ HttpResponse NonStreamingResponse(
     message["tool_calls"] = ToolCallsJson(generated.tool_calls);
   }
   choice["message"] = std::move(message);
+  choice["logprobs"] = json::Value();
+  if (request.sampling.logprobs) {
+    ChatLogprobs logprobs;
+    logprobs.Push(result.text, result.logprobs, true);
+    choice["logprobs"] = logprobs.Content(generated.content_spans);
+  }
   choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
@@ -2900,10 +3098,12 @@ HttpResponse StreamingResponse(
               generation->Cancel();
               return;
             }
+            ChatLogprobs logprobs;
             QuoteTracker quotes;
             StreamingTextFilter filter(
                 initial_output_state,
-                [&](std::string_view text, bool is_reasoning) {
+                [&](std::string_view text, bool is_reasoning,
+                    std::size_t offset) {
                   if (text.empty()) {
                     return true;
                   }
@@ -2913,8 +3113,14 @@ HttpResponse StreamingResponse(
                   } else {
                     delta["content"] = std::string(text);
                   }
+                  json::Value probabilities;
+                  if (request.sampling.logprobs && !is_reasoning) {
+                    const ContentSpan span{offset, text.size()};
+                    probabilities = logprobs.Content(std::span(&span, 1));
+                  }
                   connected = writer(
-                      Sse(ChoiceChunk(id, created, model, std::move(delta))));
+                      Sse(ChoiceChunk(id, created, model, std::move(delta),
+                                      nullptr, std::move(probabilities))));
                   return connected;
                 },
                 request.chat.response_format != nullptr,
@@ -2937,8 +3143,10 @@ HttpResponse StreamingResponse(
 
             try {
               const auto result = generation->Wait(
-                  [&](std::string_view piece) {
-                    return begin() && filter.Push(piece);
+                  [&](const TokenPiece& piece) {
+                    if (request.sampling.logprobs)
+                      logprobs.Push(piece.text, piece.logprobs);
+                    return begin() && filter.Push(piece.text);
                   },
                   on_progress, begin);
               stream_log->details = GenerationLogDetails(result);
@@ -2948,6 +3156,8 @@ HttpResponse StreamingResponse(
               }
               if (!begin())
                 return;
+              if (request.sampling.logprobs)
+                logprobs.Push({}, {}, true);
               if (!filter.Push({}, true))
                 return;
 
@@ -2968,7 +3178,11 @@ HttpResponse StreamingResponse(
                                 TextGenerationBackend::FinishReason::kStop,
                             markers, closers, quotes);
               if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                                 generated.reasoning_content)) {
+                                 generated.reasoning_content,
+                                 request.sampling.logprobs
+                                     ? std::span<const ContentSpan>(
+                                           generated.content_spans)
+                                     : std::span<const ContentSpan>{})) {
                 return;
               }
               for (std::size_t index = 0; index < generated.tool_calls.size();
@@ -3689,7 +3903,7 @@ HttpResponse CreateCompatibilityResponse(
     QuoteTracker quotes;
     StreamingTextFilter filter(
         initial,
-        [&](std::string_view piece, bool reasoning) {
+        [&](std::string_view piece, bool reasoning, std::size_t) {
           if (output.Append(piece, reasoning))
             return true;
           generation->Cancel();

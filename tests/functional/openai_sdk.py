@@ -26,6 +26,7 @@ from openai.types import Completion, CompletionChoice
 from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from discovery import check_discovery
+from logprobs import check_logprobs
 from image_inputs import check_image_count, check_image_inputs
 from tool_images import check_tool_images
 from tool_native import check_finite_argument_types, check_native_tool_schemas
@@ -2531,7 +2532,7 @@ def check_server_metrics(client, model, checks, width, context, speculative):
 
 SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "structured", "structured-limits",
               "tool-reasoning", "reasoning-separator",
-              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "logprobs", "batch",
               "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix",
               "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "system-injection")
 
@@ -2609,6 +2610,7 @@ def main():
                                      "response": [recorder.response_hook]}
     )) as client:
         suites = {
+            "logprobs": lambda: check_logprobs(client, args.model, checks),
             "messages-count-tokens": lambda: check_messages_count_tokens(
                 client, args.model, checks, args.context),
             "messages-image-counts": lambda: check_messages_image_counts(

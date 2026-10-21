@@ -1,5 +1,7 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -350,7 +352,8 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
+      TextRunnerState& state,
+      gufo::sampling::SamplerState& sampler) const override {
     const auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
@@ -360,18 +363,22 @@ public:
     if (control_->eos_after && fake.decode_count >= *control_->eos_after &&
         fake.stop_at_eos())
       return {.stop = true};
+    std::string piece = std::to_string(*fake.frontier);
     if (!control_->output_pieces.empty()) {
       const auto index =
           static_cast<std::size_t>(*fake.frontier - fake.label * 100);
       if (index >= control_->output_pieces.size())
         return {.stop = true};
-      return {.token = *fake.frontier, .piece = control_->output_pieces[index]};
+      piece = control_->output_pieces[index];
     }
-    return {
-        .stop = false,
-        .token = *fake.frontier,
-        .piece = std::to_string(*fake.frontier),
-    };
+    TextDecodeSelection selection{.token = *fake.frontier, .piece = piece};
+    if (sampler.config().logprobs) {
+      selection.logprob =
+          gufo::server::TokenLogprob{.token = piece, .logprob = -0.5};
+      for (std::size_t i = 0; i < sampler.config().top_logprobs; ++i)
+        selection.logprob->top_logprobs.push_back({piece, -0.5 - i});
+    }
+    return selection;
   }
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
@@ -2139,6 +2146,66 @@ void TestStopSequenceChunkBoundaries() {
   check({"STOP"}, "STOP", "", "STOP");
 }
 
+void TestLogprobsAcrossScheduler() {
+  for (const bool preview : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->incremental_text_is_exact = true;
+    control->preview_first_token = preview;
+    control->output_pieces = {"ab<ST", "OP>tail", "later"};
+    auto scheduler = MakeScheduler(control, 1);
+    TextGenerationScheduler::RequestMetadata metadata;
+    metadata.stop_sequences = {"<STOP>"};
+    gufo::sampling::SamplingConfig sampling;
+    sampling.logprobs = true;
+    sampling.top_logprobs = 2;
+    std::vector<gufo::server::TokenLogprob> scores;
+    std::string text;
+    const auto result =
+        scheduler->Submit({1, 10}, 8, sampling, {}, true, metadata)
+            .Wait([&](const gufo::server::TokenPiece& piece) {
+              text += piece.text;
+              scores.insert(scores.end(), piece.logprobs.begin(),
+                            piece.logprobs.end());
+              return true;
+            });
+    Expect(result.text == "ab" && text == result.text,
+           "logprobs preserves stop filtering");
+    Expect(result.logprobs.size() == 2 && scores.size() == 2,
+           "each committed token carries metadata exactly once, including "
+           "previews");
+    Expect(
+        scores[0].offset == 0 && scores[1].offset == 5 &&
+            scores[1].token == "OP>tail",
+        "queued metadata retains unfiltered byte positions across held stops");
+    Expect(scores[0].logprob == -0.5 && scores[0].top_logprobs.size() == 2,
+           "selected and alternative scores survive scheduler transport");
+    Expect(scheduler->buffered_output_bytes() == 0,
+           "metadata queue reservations are released");
+    const auto replay =
+        scheduler->Submit({1, 10}, 8, sampling, {}, false, metadata).Wait();
+    Expect(
+        replay.text == result.text && replay.logprobs.size() == scores.size(),
+        "buffered and cached requests retain logprob metadata");
+  }
+  auto control = std::make_shared<FakeControl>();
+  control->incremental_text_is_exact = true;
+  control->output_pieces = {"a"};
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {.max_buffered_output_bytes_per_request = 16});
+  gufo::sampling::SamplingConfig sampling;
+  sampling.logprobs = true;
+  sampling.top_logprobs = 20;
+  bool bounded = false;
+  try {
+    (void)scheduler->Submit({1}, 1, sampling, {}, true).Wait();
+  } catch (const gufo::server::TextGenerationError& error) {
+    bounded = error.code() ==
+              gufo::server::TextGenerationErrorCode::kOutputBackpressure;
+  }
+  Expect(bounded && scheduler->buffered_output_bytes() == 0,
+         "logprob metadata counts against output backpressure budgets");
+}
+
 void TestStopSequencesPreserveExecutedState() {
   using Finish = gufo::server::TextGenerationBackend::FinishReason;
   for (const bool multi : {false, true}) {
@@ -2773,6 +2840,7 @@ void TestEmptyTokenIsPublished() {
 }
 
 int main() {
+  TestLogprobsAcrossScheduler();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   ::setenv("NO_COLOR", "1", 1);

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <iostream>
@@ -142,7 +143,18 @@ public:
       result.cache_checkpoint_tokens = 5;
     }
     for (const std::string& piece : pieces) {
-      if ((is_cancelled && is_cancelled()) || (on_token && !on_token(piece))) {
+      gufo::server::TokenPiece output(piece);
+      if (sampling.logprobs) {
+        gufo::server::TokenLogprob token{
+            .token = piece, .logprob = -0.25 - result.tokens.size() * 0.1};
+        token.offset = result.text.size();
+        for (std::size_t i = 0; i < sampling.top_logprobs; ++i)
+          token.top_logprobs.push_back(
+              {i == 0 ? piece : "alternative", -0.25 - i});
+        output.logprobs.push_back(token);
+        result.logprobs.push_back(std::move(token));
+      }
+      if ((is_cancelled && is_cancelled()) || (on_token && !on_token(output))) {
         result.cancelled = true;
         result.finish_reason = FinishReason::kCancelled;
         return result;
@@ -420,6 +432,120 @@ void TestStreamingWithoutUsage() {
                response.stream_log->details.find("generated_tokens=1") !=
                    std::string::npos,
            "Request diagnostics do not depend on client usage preference");
+  }
+}
+
+void TestChatLogprobs() {
+  using gufo::json::Value;
+  const auto token_bytes = [](const Value& items) {
+    std::string bytes;
+    for (const auto& item : items.items()) {
+      Expect(
+          item.find("token")->is_string() && item.find("logprob")->is_number(),
+          "each token has text and a numeric log probability");
+      Expect(item.find("logprob")->as_double() < 0,
+             "fixture scores survive transport");
+      for (const auto& byte : item.find("bytes")->items())
+        bytes.push_back(static_cast<char>(byte.as_double()));
+    }
+    return bytes;
+  };
+  const auto check = [&](std::vector<std::string> pieces, bool reasoning,
+                         std::string expected, std::string expected_bytes,
+                         std::size_t top_count, std::string_view extra = "{}") {
+    FakeBackend backend;
+    backend.pieces = std::move(pieces);
+    auto body = gufo::json::parse(
+        R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],"logprobs":true})");
+    body["chat_template_kwargs"]["enable_thinking"] = reasoning;
+    body["top_logprobs"] = top_count;
+    const auto extra_fields = gufo::json::parse(extra);
+    for (const auto& [key, value] : extra_fields.members())
+      body[key] = value;
+    auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200, "logprobs request succeeds");
+    const auto parsed = gufo::json::parse(response.body);
+    const auto& choice = parsed.find("choices")->items().front();
+    const auto& probabilities = *choice.find("logprobs");
+    Expect(probabilities.find("refusal")->is_null(),
+           "refusal logprobs are null");
+    Expect(choice.find("message")->member_str("content") == expected,
+           "logprobs preserves visible content");
+    Expect(token_bytes(*probabilities.find("content")) == expected_bytes,
+           "logprob bytes preserve original visible bytes");
+    for (const auto& token : probabilities.find("content")->items()) {
+      Expect(token.find("top_logprobs")->size() == top_count,
+             "requested alternatives are retained");
+      for (const auto& alternative : token.find("top_logprobs")->items())
+        Expect(alternative.find("bytes")->is_array() &&
+                   alternative.find("logprob")->is_number(),
+               "alternative token schema matches OpenAI");
+    }
+    body["stream"] = true;
+    response = gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200 && response.streaming_body,
+           "logprobs stream succeeds");
+    std::string content, bytes;
+    Value streamed = Value::array();
+    bool done = false;
+    response.streaming_body([&](std::string_view chunk) {
+      if (chunk == "data: [DONE]\n\n") {
+        done = true;
+        return true;
+      }
+      const auto event = gufo::json::parse(chunk.substr(6));
+      Expect(!event.find("error"), "logprobs streaming has no error");
+      for (const auto& item : event.find("choices")->items()) {
+        content += item.find("delta")->member_str("content");
+        const auto* scores = item.find("logprobs");
+        if (scores && !scores->is_null()) {
+          bytes += token_bytes(*scores->find("content"));
+          for (const auto& token : scores->find("content")->items())
+            streamed.push_back(token);
+        }
+      }
+      return true;
+    });
+    Expect(done && content == expected && bytes == expected_bytes,
+           "streamed content and token bytes match buffered response");
+    Expect(streamed.dump() == probabilities.find("content")->dump(),
+           "streaming retains the same token scores and alternatives");
+  };
+  check({"Hello", " world", "!"}, false, "Hello world!", "Hello world!", 0);
+  check({"Hello", " world"}, false, "Hello world", "Hello world", 2);
+  check({"A", "\xF0\x9F", "\x98\x80", "Z"}, false, "A😀Z", "A😀Z", 20);
+  check({"secret", "</thi", "nk>", "\n\n", "answer"}, true, "answer", "answer",
+        2);
+  check({"secret</think>\n\nanswer"}, true, "answer", "answer", 2);
+  check(
+      {"before", "<tool_call>\n<function=lookup>\n</function>\n</tool_call>",
+       "after"},
+      false, "beforeafter", "beforeafter", 2,
+      R"({"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]})");
+  check({"secret", "</think>", "{", "\"value\":", "1}"}, true, "{\"value\":1}",
+        "{\"value\":1}", 2, R"({"response_format":{"type":"json_object"}})");
+  check({"unfinished reasoning"}, true, "", "", 0);
+  check({"a", "\xFF", "z"}, false, "a\xEF\xBF\xBDz", "a\xFFz", 0);
+  check({"\xE2"}, false, "\xEF\xBF\xBD", "\xE2", 0);
+  FakeBackend backend;
+  const auto base = gufo::json::parse(
+      R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})");
+  for (const auto* fields :
+       {R"({"logprobs":"true"})", R"({"logprobs":true,"top_logprobs":-1})",
+        R"({"logprobs":true,"top_logprobs":21})",
+        R"({"logprobs":true,"top_logprobs":1.5})",
+        R"({"logprobs":true,"top_logprobs":false})", R"({"top_logprobs":0})"}) {
+    auto body = base;
+    const auto parsed_fields = gufo::json::parse(fields);
+    for (const auto& [key, value] : parsed_fields.members())
+      body[key] = value;
+    const auto before = backend.chat_calls.load();
+    Expect(
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend).status ==
+                400 &&
+            backend.chat_calls == before,
+        "invalid logprobs controls fail before inference");
   }
 }
 
@@ -2337,7 +2463,7 @@ void TestStopSequencesAndDefaultFields() {
              200,
          "explicit text-only and disabled logprobs defaults work");
   for (const auto* request :
-       {R"({"logprobs":true})", R"({"top_logprobs":3})",
+       {R"({"logprobs":1})", R"({"top_logprobs":3})",
         R"({"modalities":["text","audio"]})", R"({"audio":{}})",
         R"({"response_format":{"type":"text","unexpected":true}})"}) {
     auto invalid = base;
@@ -5213,6 +5339,7 @@ void TestJinjaContextForwarding() {
 }
 
 int main() {
+  TestChatLogprobs();
   TestJinjaContextForwarding();
   TestToolCallRenderParseRoundTrip();
   TestHistoricalTypedArgumentsUseTojson();

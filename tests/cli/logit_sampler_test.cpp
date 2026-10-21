@@ -22,6 +22,42 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
+void TestModelLogprobs() {
+  using gufo::sampling::ComputeLogprobs;
+  const std::array<float, 4> logits{10000, 10000, 9999, -10000};
+  const double normalizer = std::log(2.0 + std::exp(-1.0));
+  const auto result = ComputeLogprobs(logits, 2, 20);
+  Expect(std::abs(result.logprob - (-1.0 - normalizer)) < 1e-12,
+         "log-softmax stays stable with large logits");
+  Expect(result.top.size() == 4 && result.top[0].token == 0 &&
+             result.top[1].token == 1,
+         "top probabilities are sorted with deterministic tie breaks");
+  Expect(result.top[3].value == -9999,
+         "extreme unlikely scores use finite sentinel");
+  Expect(ComputeLogprobs(logits, 0, 0).top.empty(),
+         "alternatives are optional");
+  Expect(ComputeLogprobs(logits, 0, 0).logprob < 0,
+         "greedy model logprob is not zero");
+  const std::array<float, 3> invalid{0, std::numeric_limits<float>::quiet_NaN(),
+                                     -std::numeric_limits<float>::infinity()};
+  const auto finite = ComputeLogprobs(invalid, 0, 20);
+  Expect(finite.logprob == 0 && finite.top.size() == 1,
+         "non-finite logits are excluded as in the sampler");
+  gufo::sampling::SamplingConfig config{
+      .temperature = 0.7F, .top_k = 2, .seed = 31};
+  gufo::sampling::SamplerState plain(config);
+  config.logprobs = true;
+  config.top_logprobs = 2;
+  gufo::sampling::SamplerState reported(config);
+  for (int i = 0; i < 20; ++i) {
+    const auto token = reported.Sample(logits);
+    (void)ComputeLogprobs(logits, token, 2);
+    Expect(token == plain.Sample(logits) &&
+               reported.rng_state() == plain.rng_state(),
+           "reporting leaves seeded token selection and RNG unchanged");
+  }
+}
+
 void TestGreedySelectsFiniteArgmaxWithoutAdvancingRng() {
   const std::array<float, 4> logits = {
       -1.0F, 5.0F, std::numeric_limits<float>::quiet_NaN(), 2.0F};
@@ -619,6 +655,7 @@ void TestResponsePenaltyScope() {
 }  // namespace
 
 int main() {
+  TestModelLogprobs();
   bool sub_float_resolution = false;
   for (std::uint64_t seed = 1; seed < 100; ++seed) {
     auto state = seed;

@@ -822,8 +822,45 @@ labelled executed model state. Stops must be nonempty, at most 4 KiB each and
 Nullable Chat Completions defaults retain server settings, including sampling
 and token limits. `logprobs: false`, empty `logit_bias`,
 `response_format: {"type":"text"}` and `modalities: ["text"]` are accepted.
-Actual log probabilities, token biases and audio output remain unsupported
-and return explicit errors.
+Token biases and audio output remain unsupported and return explicit errors.
+
+### Token log probabilities
+
+Gufo follows the [OpenAI Chat Completions logprobs schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+Chat Completions accepts `logprobs: true` and optional `top_logprobs: 0` through
+`20` (default `0`). Both buffered and streamed choices return
+`logprobs.content` entries containing `token`, `logprob`, `bytes` and
+`top_logprobs`; `logprobs.refusal` is null. Each alternative contains `token`,
+`logprob` and `bytes`. With logprobs disabled, buffered choices return null and
+stream chunks omit the field. Role, reasoning, tool-call and terminal chunks
+carry no content logprobs.
+
+```python
+completion = client.chat.completions.create(
+    model="gufo", messages=[{"role": "user", "content": "Hello"}],
+    logprobs=True, top_logprobs=5,
+)
+for token in completion.choices[0].logprobs.content:
+    print(token.token, token.logprob, token.top_logprobs)
+```
+
+Scores are natural-log probabilities from the full target-model log-softmax,
+before temperature, penalties, grammar masks and sampling filters. Greedy
+requests therefore report model confidence rather than probability one.
+Extremely unlikely or non-finite entries use the finite `-9999.0` sentinel;
+non-finite logits are excluded from normalization and alternatives.
+
+Token bytes retain their original byte values, including tokens that split a
+Unicode scalar; the `token` string replaces incomplete or malformed UTF-8.
+Reasoning, tool framing and stop sequences are excluded from content scores.
+When a filter cuts through a token, its visible fragment keeps the original
+token's probability. Alternative tokens retain their complete bytes.
+
+Logprob requests use target-only, single-token decoding even when a speculative
+sidecar is loaded. They perform zero draft rounds and may be slower than ordinary
+requests. Probability metadata counts toward the output and streaming-buffer
+limits. The legacy Completions and Responses endpoints do not expose this
+Chat Completions parameter.
 
 ### Structured output
 
@@ -900,9 +937,9 @@ Return an OpenAI-style error object:
 ```json
 {
   "error": {
-    "message": "Unsupported field: logprobs",
+    "message": "Unsupported field: audio",
     "type": "invalid_request_error",
-    "param": "logprobs",
+    "param": "audio",
     "code": "unsupported_parameter"
   }
 }

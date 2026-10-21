@@ -183,7 +183,49 @@ constexpr std::size_t kSkipBlock = 64;
 
 }  // namespace
 
+TokenLogprobs ComputeLogprobs(std::span<const float> logits, TokenId token,
+                              std::size_t top_count) {
+  if (token >= logits.size() || top_count > 20)
+    throw std::invalid_argument("invalid token logprobs request");
+  double maximum = -std::numeric_limits<double>::infinity();
+  for (const auto value : logits)
+    if (std::isfinite(value))
+      maximum = std::max(maximum, static_cast<double>(value));
+  if (!std::isfinite(maximum))
+    throw std::runtime_error("logprobs requires finite model logits");
+  double sum = 0;
+  for (const auto value : logits)
+    if (std::isfinite(value))
+      sum += std::exp(static_cast<double>(value) - maximum);
+  const double log_sum = std::log(sum);
+  const auto logprob = [&](TokenId id) {
+    return std::isfinite(logits[id])
+               ? std::max(-9999.0,
+                          (static_cast<double>(logits[id]) - maximum) - log_sum)
+               : -9999.0;
+  };
+  TokenLogprobs result{.logprob = logprob(token)};
+  if (top_count != 0) {
+    std::vector<TokenId> ids;
+    ids.reserve(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      if (std::isfinite(logits[i]))
+        ids.push_back(static_cast<TokenId>(i));
+    const auto count = std::min(top_count, ids.size());
+    std::partial_sort(
+        ids.begin(), ids.begin() + count, ids.end(), [&](TokenId a, TokenId b) {
+          return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
+        });
+    for (std::size_t i = 0; i < count; ++i)
+      result.top.push_back({ids[i], logprob(ids[i])});
+  }
+  return result;
+}
+
 void SamplingConfig::Validate() const {
+  if (top_logprobs > 20 || (top_logprobs != 0 && !logprobs))
+    throw std::invalid_argument(
+        "top_logprobs requires logprobs and must be at most 20");
   if (constraint && (!constraint->grammar || !constraint->vocabulary ||
                      constraint->vocabulary->size() == 0))
     throw std::invalid_argument("sampling constraint is incomplete");

@@ -23,6 +23,36 @@
 
 namespace gufo::server {
 
+struct TokenLogprob {
+  // Original bytes; individual tokens need not be valid UTF-8.
+  std::string token;
+  double logprob{0.0};
+  struct Alternative {
+    std::string token;
+    double logprob{0.0};
+  };
+  std::vector<Alternative> top_logprobs{};
+  std::size_t offset{0};  // Byte offset in the unfiltered generated text.
+
+  [[nodiscard]] std::size_t StorageBytes() const noexcept {
+    std::size_t bytes = sizeof(TokenLogprob) + token.size();
+    for (const auto& alternative : top_logprobs)
+      bytes += sizeof(Alternative) + alternative.token.size();
+    return bytes;
+  }
+};
+
+/// Rich queued output; existing text-only consumers can use string_view.
+struct TokenPiece {
+  TokenPiece() = default;
+  TokenPiece(std::string value) : text(std::move(value)) {}
+  TokenPiece(std::string_view value) : text(value) {}
+  TokenPiece(const char* value) : text(value) {}
+  operator std::string_view() const noexcept { return text; }
+  std::string text;
+  std::vector<TokenLogprob> logprobs;
+};
+
 enum class TextGenerationErrorCode : std::uint8_t {
   kQueueFull,
   kClientQueueFull,
@@ -129,11 +159,11 @@ struct ChatRequest {
 ///
 /// Implementations retain ownership of tokenization, templates, complete
 /// continuation state, and execution resources. The transport observes only
-/// generated text pieces and aggregate request metrics.
+/// generated text pieces, optional token scores and aggregate request metrics.
 class TextGenerationBackend {
 public:
   using CancellationCheck = std::function<bool()>;
-  using TokenCallback = std::function<bool(std::string_view)>;
+  using TokenCallback = std::function<bool(const TokenPiece&)>;
 
   /// llama-server `prompt_progress`; `processed` includes cached tokens.
   struct PromptProgress {
@@ -190,6 +220,7 @@ public:
   struct Result {
     std::string text;
     std::vector<tokenization::TokenId> tokens;
+    std::vector<TokenLogprob> logprobs;
     std::size_t prompt_tokens{0};
     std::size_t cached_prompt_tokens{0};
     std::size_t cache_restore_bytes{0};

@@ -173,6 +173,7 @@ struct TextDecodeSelection {
   bool stop{false};
   TextRunnerToken token{0};
   std::string piece;
+  std::optional<TokenLogprob> logprob{};
 };
 
 struct TextDecodeStep {
@@ -316,6 +317,10 @@ public:
   }
   [[nodiscard]] virtual std::string Decode(
       std::span<const TextRunnerToken> tokens) const = 0;
+
+  [[nodiscard]] TokenLogprob DescribeLogprobs(std::span<const float> logits,
+                                              TextRunnerToken token,
+                                              std::size_t top_count) const;
 
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> CreateState()
       const = 0;

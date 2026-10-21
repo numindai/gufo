@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace gufo::core {
 
@@ -12,15 +13,34 @@ namespace gufo::core {
 // wait for the next piece, while malformed subsequences become U+FFFD.
 class Utf8Decoder {
 public:
-  std::string Push(std::string_view bytes, bool final = false) {
+  struct SourceSpan {
+    std::size_t source_offset;
+    std::size_t source_size;
+    std::size_t text_offset;
+    std::size_t text_size;
+  };
+
+  /// Optional source mapping for consumers retaining token byte provenance.
+  /// Text offsets are relative to this call's output; source offsets are
+  /// absolute.
+  std::string Push(std::string_view bytes, bool final = false,
+                   std::vector<SourceSpan>* spans = nullptr) {
     pending_.append(bytes);
     std::string output;
     output.reserve(pending_.size());
     std::size_t offset = 0;
+    const auto record = [&](std::size_t begin, std::size_t text_begin) {
+      if (spans)
+        spans->push_back({source_offset_ + begin, offset - begin, text_begin,
+                          output.size() - text_begin});
+    };
     while (offset < pending_.size()) {
+      const auto begin = offset;
+      const auto text_begin = output.size();
       const auto lead = static_cast<unsigned char>(pending_[offset]);
       if (lead < 0x80) {
         output.push_back(pending_[offset++]);
+        record(begin, text_begin);
         continue;
       }
       const unsigned length = lead >= 0xC2 && lead <= 0xDF   ? 2
@@ -30,6 +50,7 @@ public:
       if (length == 0) {
         output.append("\xEF\xBF\xBD");
         ++offset;
+        record(begin, text_begin);
         continue;
       }
       unsigned prefix = 1;
@@ -51,13 +72,16 @@ public:
         output.append("\xEF\xBF\xBD");
         offset += prefix;
       }
+      record(begin, text_begin);
     }
     pending_.erase(0, offset);
+    source_offset_ += offset;
     return output;
   }
 
 private:
   std::string pending_;
+  std::size_t source_offset_{0};
 };
 
 }  // namespace gufo::core
